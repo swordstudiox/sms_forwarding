@@ -11,17 +11,49 @@
 #include "scheduler.h"
 
 static DNSServer dnsServer;  // 配网模式的强制门户 DNS
+static bool apManualMode = false;  // true=BOOT 长按强制开启的配网 AP，STA 连上后也不自动关闭
 
 // 开启配网热点(SoftAP + 强制门户)：STA 连不上/未配置时进入，等用户网页配 WiFi
-void startProvisioningAP() {
+void startProvisioningAP(bool manual = false) {
+  if (apMode) {
+    if (manual && !apManualMode) {
+      apManualMode = true;
+      logCaptureLn("BOOT长按触发：保留当前配网热点，已切为手动配网模式");
+    }
+    logCaptureLn(String("配网热点已开启，请访问 http://") + WiFi.softAPIP().toString());
+    return;
+  }
   apMode = true;
-  String apName = String(AP_SSID_PREFIX) + String((uint32_t)ESP.getEfuseMac(), HEX);
+  apManualMode = manual;
+  char suffix[5];
+  snprintf(suffix, sizeof(suffix), "%04X", (unsigned)(esp_random() & 0xFFFF));
+  String apName = String(AP_SSID_PREFIX) + suffix;
+  IPAddress apIp(AP_IP_ADDR);
+  IPAddress apGw(AP_IP_ADDR);
+  IPAddress apMask(255, 255, 255, 0);
   WiFi.mode(WIFI_AP_STA);            // AP_STA：开热点同时可扫描周边 WiFi
+  WiFi.softAPConfig(apIp, apGw, apMask);
   WiFi.softAP(apName.c_str());       // 开放热点便于连接；管理页仍受 Basic Auth 保护
   IPAddress ip = WiFi.softAPIP();
   dnsServer.start(53, "*", ip);      // 强制门户：所有域名解析到本机，连入即弹配网页
-  logCaptureLn(String("未连上 WiFi，已开启配网热点: ") + apName);
+  logCaptureLn(String(manual ? "BOOT长按触发，已开启配网热点: " : "未连上 WiFi，已开启配网热点: ") + apName);
   logCaptureLn(String("请连接该热点后打开 http://") + ip.toString() + " 配置 WiFi");
+}
+
+void provisionButtonTick() {
+  static unsigned long downSince = 0;
+  static bool triggered = false;
+  bool pressed = (digitalRead(PROVISION_BUTTON_PIN) == LOW);
+  if (!pressed) {
+    downSince = 0;
+    triggered = false;
+    return;
+  }
+  if (downSince == 0) downSince = millis();
+  if (!triggered && millis() - downSince >= PROVISION_BUTTON_HOLD_MS) {
+    triggered = true;
+    startProvisioningAP(true);
+  }
 }
 
 // 按配置应用 NTP/时区(time() 仍为 UTC，偏移仅用于本地时间显示；前端按 tzOffsetMin 格式化)
@@ -34,6 +66,7 @@ void applyTimeConfig() {
 void setup() {
   initConcurrency();   // 先建好 gLogMux/gWorkMux，使后续 logCapture 与 worker 线程安全
   pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(PROVISION_BUTTON_PIN, INPUT_PULLUP);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.begin(115200);
   logCaptureF("固件 %s 启动，复位原因=%d\n", FW_VERSION, (int)esp_reset_reason());
@@ -77,7 +110,7 @@ void setup() {
     logCaptureLn(String(WiFi.RSSI()) + " dBm");
   } else {
     // 连不上/未配置 → 开配网热点(强制门户)，等用户网页配 WiFi，不再重启死循环
-    startProvisioningAP();
+    startProvisioningAP(false);
   }
 
   static const char* headerKeys[] = {"If-None-Match"};
@@ -170,13 +203,14 @@ void wifiEnsureConnected() {
   lastCheck = millis();
 
   if (WiFi.status() == WL_CONNECTED) {
-    if (apMode) {
+    if (apMode && !apManualMode) {
       // 开机时连不上而进了配网热点，但 STA 现已连上(自动重连/凭据可用)：拆掉热点+强制门户，
       // 回到纯 STA。否则瞬时开机断网会让设备永久卡在开放热点+DNS 劫持里(apMode 此前永不清除)。
       dnsServer.stop();
       WiFi.softAPdisconnect(true);
       WiFi.mode(WIFI_STA);
       apMode = false;
+      apManualMode = false;
       logCaptureLn(String("WiFi 已连上，关闭配网热点。IP: " + WiFi.localIP().toString()));
     }
     if (wasDown) {
@@ -212,6 +246,7 @@ void loop() {
   // 杜绝"web handler 调阻塞 AT → AT 泵 handleClient → 重入 WebServer"导致的崩溃(如开启蜂窝数据保存)。
   gInWebRequest = true; server.handleClient(); gInWebRequest = false;
   if (apMode) { dnsServer.processNextRequest(); }  // 配网模式强制门户 DNS
+  provisionButtonTick();       // 运行中长按 BOOT 5 秒，强制开启配网热点
   if (!configValid) {
     if (millis() - lastPrintTime >= 60000) {   // 60s 一次，避免刷屏占满日志环
       lastPrintTime = millis();

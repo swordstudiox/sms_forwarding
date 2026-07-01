@@ -1301,15 +1301,9 @@ void handleModem() {
         int rssi = csqLine.substring(csqLine.indexOf(':') + 1, commaIdx).toInt();
         int ber = csqLine.substring(commaIdx + 1).toInt();
         int dbm = (rssi == 99) ? -999 : (-113 + rssi * 2);
-        String quality;
-        if (rssi >= 19) quality = "优秀";
-        else if (rssi >= 14) quality = "良好";
-        else if (rssi >= 10) quality = "一般";
-        else if (rssi >= 5) quality = "较差";
-        else quality = "很差";
         // 注意：AT+CSQ 给的是 RSSI(总接收功率)，不是 RSRP(服务小区每RE功率)。此前误标为 RSRP，
         // 导致与首页(AT+MUESTATS 真实 RSRP)对不上。这里如实标为信号强度(RSSI)，原始值标为 CSQ。
-        message = "信号强度(RSSI): " + String(dbm) + " dBm (" + quality + "), CSQ原始值: " + String(rssi) + ", BER: " + String(ber);
+        message = "信号强度(RSSI): " + String(dbm) + " dBm, CSQ原始值: " + String(rssi) + ", BER: " + String(ber);
         success = true;
       }
     }

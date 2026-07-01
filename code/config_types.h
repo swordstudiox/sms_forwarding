@@ -6,9 +6,12 @@
 // 固件版本（/status 与启动日志展示）
 #define FW_VERSION "1.0.1"
 
-// 配网热点(STA 连接失败/未配置时广播)
+// 配网热点(STA 连接失败/未配置时广播；运行中长按 BOOT 也可强制开启)
 #define AP_SSID_PREFIX "SMS-Forwarder-"
+#define AP_IP_ADDR 192,168,1,1
 #define WIFI_CONNECT_TIMEOUT_MS 20000UL   // STA 首次连接超时，超时则进配网 AP
+#define PROVISION_BUTTON_PIN 9             // ESP32-C3 BOOT 键(GPIO9)，运行中长按进入配网热点
+#define PROVISION_BUTTON_HOLD_MS 5000UL    // 长按 5 秒触发强制配网
 
 // 推送通道类型
 enum PushType {

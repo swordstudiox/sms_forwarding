@@ -164,5 +164,6 @@ bool isConfigValid() {
 
 // 获取当前设备URL
 String getDeviceUrl() {
+  if (apMode) return "http://" + WiFi.softAPIP().toString() + "/";
   return "http://" + WiFi.localIP().toString() + "/";
 }

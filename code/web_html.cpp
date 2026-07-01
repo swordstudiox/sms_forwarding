@@ -328,7 +328,7 @@ const char* htmlPage = R"rawliteral(
       <p class="page-subtitle">设备信号、转发与系统状态遥测</p>
       <!-- 信号量表(签名) -->
       <div class="card sig-card" style="margin-bottom:14px">
-          <div class="card-header"><span class="dot" id="dotSig"></span>信号 SIGNAL<span id="ovRefresh" style="margin-left:auto;color:var(--faint);font-size:10.5px;font-family:var(--mono);font-weight:400;">设备 --</span></div>
+          <div class="card-header">信号 SIGNAL<span id="ovRefresh" style="margin-left:auto;color:var(--faint);font-size:10.5px;font-family:var(--mono);font-weight:400;">设备 --</span></div>
         <div class="card-body">
           <div class="gauge"><span class="gl">CSQ</span><span class="track"><i class="tk" style="left:26%"></i><i class="tk" style="left:45%"></i><span class="fill" id="gCsq"></span></span><span class="gv" id="gCsqV">--</span></div>
           <div class="gauge"><span class="gl">RSSI</span><span class="track"><i class="tk" style="left:25%"></i><i class="tk" style="left:58%"></i><span class="fill" id="gRssi"></span></span><span class="gv" id="gRssiV">--</span></div>
@@ -340,13 +340,13 @@ const char* htmlPage = R"rawliteral(
       </div>
       <!-- KPI 指标条 -->
       <div class="stat-row">
-        <div class="stat"><div class="k"><span class="dot" id="dotData"></span>蜂窝数据</div><div class="v" id="ovData">--</div><div class="s" id="ovDataSub">--</div></div>
+        <div class="stat"><div class="k">蜂窝数据</div><div class="v" id="ovData">--</div><div class="s" id="ovDataSub">--</div></div>
         <div class="stat"><div class="k">累计处理</div><div class="v" id="ovSms">--</div><div class="s" id="ovLastSms">--</div></div>
         <div class="stat"><div class="k">收件箱</div><div class="v" id="ovInbox">--</div><div class="s">本地留存</div></div>
       </div>
       <!-- 最新接收 / 验证码 hero -->
       <div class="card" id="otpHeroCard" style="display:none;margin-bottom:14px;border-left:2px solid var(--amber);">
-        <div class="card-header"><span class="dot ok"></span>最新接收　验证码<a class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="switchPanel('inbox')">打开收件箱</a></div>
+        <div class="card-header">最新接收　验证码<a class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="switchPanel('inbox')">打开收件箱</a></div>
         <div class="card-body" style="display:flex;align-items:center;gap:16px;">
           <div style="flex:1;min-width:0;">
             <div class="mono" id="ohFrom" style="font-weight:600;margin-bottom:4px;"></div>
@@ -405,7 +405,7 @@ const char* htmlPage = R"rawliteral(
           </div>
         </div>
         <div class="card">
-          <div class="card-header"><span class="dot" id="dotWifi"></span>WiFi 详细信息</div>
+          <div class="card-header">WiFi 详细信息</div>
           <div class="card-body">
             <table class="info-table">
               <tr><td>当前 SSID</td><td id="wfSsid">--</td></tr>
@@ -1126,14 +1126,7 @@ const char* htmlPage = R"rawliteral(
     function fmtCsq(c) {
       if (c == null || c >= 99 || c < 0) return '无信号';
       var dbm = -113 + 2 * c;
-      var q = c >= 19 ? '优秀' : c >= 14 ? '良好' : c >= 10 ? '一般' : c >= 5 ? '较差' : '很差';
-      return dbm + ' dBm ' + q;
-    }
-    // WiFi RSSI 质量分级，与诊断"WiFi 状态"查询一致
-    function fmtWifiRssi(r) {
-      if (r == null || r >= 0 || r < -200) return '--';
-      var q = r >= -50 ? '信号极好' : r >= -60 ? '信号很好' : r >= -70 ? '信号良好' : r >= -80 ? '信号一般' : r >= -90 ? '信号较弱' : '信号很差';
-      return r + ' dBm (' + q + ')';
+      return dbm + ' dBm';
     }
     var devTz = 480;  // 设备时区分钟偏移(从 /status 更新)，按此格式化时间，与查看者所在时区无关
     var apHandled = false;  // 配网模式只自动跳转一次
@@ -1157,8 +1150,6 @@ const char* htmlPage = R"rawliteral(
       return (m[v] || '原因码') + ' (' + v + ')';
     }
     function kb(b) { return Math.round(b / 1024) + ' KB'; }
-    function setDot(id, lvl) { var e = document.getElementById(id); if (e) e.className = 'dot ' + lvl; }
-    function sigLevel(c) { if (c == null || c >= 99 || c < 0) return 'bad'; return c >= 14 ? 'ok' : c >= 8 ? 'warn' : 'bad'; }
     // 信号量表填充：raw 映射到 lo..hi 百分比，按 warnAt/okAt 染色(越大越好)
     function setGauge(id, raw, lo, hi, label, warnAt, okAt) {
       var fill = document.getElementById(id), vEl = document.getElementById(id + 'V');
@@ -1209,10 +1200,8 @@ const char* htmlPage = R"rawliteral(
         setGauge('gRsrq', d.rsrq, -20, -3, fmtDb(d.rsrq), -15, -10);
         setGauge('gSinr', d.sinr, 0, 30, fmtDb(d.sinr), 0, 13);
         setGauge('gWifi', (d.rssi == null || d.rssi >= 0) ? null : d.rssi, -90, -40, (d.rssi == null || d.rssi >= 0) ? '--' : (d.rssi + ' dBm'), -75, -65);  // WiFi RSSI(质量见下方卡片)
-        setDot('dotSig', sigLevel(d.csq));
         ovSet('ovData', d.dataEnabled ? '已启用' : '已禁用');
         ovSet('ovDataSub', d.dataEnabled ? (d.cellIp || '获取中') : '零流量');
-        setDot('dotData', d.dataEnabled ? 'warn' : 'ok');   // 禁用=安全(绿)，启用=在用流量(橙)
         ovSet('ovSms', d.smsTotal); ovSet('ovLastSms', '最近 ' + fmtEpoch(d.lastSmsEpoch));
         ovSet('ovInbox', d.inboxCount + ' 条');
         var busyQueues = !!(d.slowBusy || d.fwdQueueDepth || d.queueDepth || d.outSmsQueueDepth || d.emailQueueDepth);
@@ -1237,7 +1226,6 @@ const char* htmlPage = R"rawliteral(
         ovSet('wfIp', d.ip || '--'); ovSet('wfGw', d.gw || '--'); ovSet('wfMask', d.mask || '--');
         ovSet('wfDns', d.dns || '--'); ovSet('wfMac', d.mac || '--'); ovSet('wfBssid', d.bssid || '--');
         ovSet('wfChan', (d.chan != null && d.chan > 0) ? d.chan : '--');
-        setDot('dotWifi', d.wifiConnected ? 'ok' : 'bad');
         // 转发与系统
         var qText = d.fwdQueueDepth + ' / ' + d.queueDepth + ' / ' + (d.outSmsQueueDepth || 0) + ' / ' + (d.emailQueueDepth || 0);
         if (d.slowBusy) qText += ' · 推送中';
