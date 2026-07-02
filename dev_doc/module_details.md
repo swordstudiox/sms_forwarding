@@ -260,7 +260,7 @@ ESP32                         模组
 
 并发保护：队列槽位与 worker 对 `config.pushChannels[]`/`config.smtp*` 的快照读用 **`gWorkMux`**；日志用 **`gLogMux`**；**绝不持锁发网络**。`sendToChannel()`/`sendEmailNotification()` 都使用锁内拷出的快照，不在发送期间读全局 `config`。详见架构文档「并发与加锁」。
 
-> 保号动作（约 **48KB UDP 上行流量**）在 `scheduler.cpp` + `modem.cpp::consumeCellularDataBytes()`，走模组 AT，留在 loop 任务（不在本 worker）。
+> 保号动作（蜂窝 HTTP payload 下载）在 `scheduler.cpp` + `modem.cpp::fetchCellularKeepAliveUrl()`，走模组 AT，留在 loop 任务（不在本 worker）。
 
 ### 推送通道执行流程（worker 内逐通道）
 

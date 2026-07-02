@@ -84,10 +84,6 @@ const char* htmlPage = R"rawliteral(
     .sidebar-section-label { font-size: 9.5px; color: var(--faint); padding: 12px 14px 6px; text-transform: uppercase; letter-spacing: 0.16em; font-family: var(--mono); }
     .sidebar-footer { padding: 12px 14px; border-top: 1px solid var(--hairline); }
     .sidebar-footer .btn { width: 100%; }
-    .sidebar-about { font-size: 10.5px; color: var(--faint); line-height: 1.6; margin-bottom: 10px; }
-    .sidebar-about b { color: var(--mute); font-weight: 600; font-size: 12px; display: block; margin-bottom: 2px; }
-    .sidebar-about a { color: var(--mute); text-decoration: none; }
-    .sidebar-about a:hover { color: var(--amber); }
 
     /* Main */
     .main { margin-left: var(--sidebar-w); flex: 1; padding: 24px 26px; max-width: 1480px; width: 100%; }
@@ -267,7 +263,7 @@ const char* htmlPage = R"rawliteral(
       .sidebar { width: 50px; }
       .sidebar-brand h2 { font-size: 0; }
       .sidebar-brand h2::first-letter { font-size: 16px; }
-      .sidebar-brand span, .sidebar-section-label, .sidebar-about { display: none; }
+      .sidebar-brand span, .sidebar-section-label { display: none; }
       .sidebar-nav a { padding: 10px; justify-content: center; }
       .sidebar-nav a span:not(.ico) { display: none; }
       .sidebar-nav a .ico { font-size: 16px; }
@@ -315,7 +311,7 @@ const char* htmlPage = R"rawliteral(
       <a data-panel="keepalive"><span class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><circle cx="12" cy="15" r="3"/></svg></span> <span>定时任务</span></a>
       <div class="sidebar-divider"></div>
       <div class="sidebar-section-label">系统</div>
-      <a data-panel="settings"><span class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span> <span>系统</span></a>
+      <a data-panel="settings"><span class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span> <span>系统设置</span></a>
     </nav>
     <!-- 主题切换已移除：固定浅色 -->
   </aside>
@@ -436,7 +432,7 @@ const char* htmlPage = R"rawliteral(
           <div class="card-body">
             <div class="form-group"><label class="form-label"><input type="checkbox" name="dataEnabled" %DATA_CHECKED%> 允许蜂窝数据（流量）</label>
               <p class="form-hint" style="color:var(--error);font-weight:600">注意：开启会导致收不到短信，模组会掉为纯数据附着，丢失承载短信的 CS/SGs 信令域（漫游时尤其明显）。本机经 WiFi 转发，无需开流量，保持关闭即可。</p>
-              <p class="form-hint">默认关闭=禁用 PDP，零流量。仅在需要保号 UDP 流量 / 蜂窝 IP 时临时开启。</p></div>
+              <p class="form-hint">默认关闭=禁用 PDP，零流量。仅在需要保号 HTTP payload / 蜂窝 IP 时临时开启。</p></div>
             <div class="form-group"><label class="form-label">APN</label><input class="form-input" type="text" name="apn" value="%APN%" placeholder="留空=运营商自动（如 cmnet）"></div>
             <div class="form-group"><label class="form-label">运营商</label>
               <input class="form-input" type="text" name="operatorPlmn" value="%OPERATOR_PLMN%" placeholder="留空 = 自动注册（推荐）" list="plmnList">
@@ -488,9 +484,9 @@ const char* htmlPage = R"rawliteral(
       </div>
     </div>
 
-    <!-- ===== 系统（账号 / 时间 / 维护） ===== -->
+    <!-- ===== 系统设置（账号 / 时间 / 维护） ===== -->
     <div class="panel" id="panel-settings">
-      <h1 class="page-title">系统</h1>
+      <h1 class="page-title">系统设置</h1>
       <p class="page-subtitle">管理账号、设备时间与维护（重启 / 配置备份 / 固件升级）</p>
       <div class="card-grid">
         <form action="/save" method="POST" id="mainForm">
@@ -629,7 +625,7 @@ const char* htmlPage = R"rawliteral(
       <input type="hidden" name="schedForm" value="1">
       <div class="schedule-grid">
         <div class="card">
-          <div class="card-header">保号设置<span class="schedule-tag">48KiB UDP</span></div>
+          <div class="card-header">保号设置<span class="schedule-tag">HTTP payload</span></div>
           <div class="card-body">
             <label class="schedule-switch"><input type="checkbox" id="kaEnabled" name="kaEnabled"> 启用保号定时</label>
             <div class="schedule-status" id="kaCountdown">距下次保号: --</div>
@@ -642,13 +638,14 @@ const char* htmlPage = R"rawliteral(
               <div class="form-group">
                 <label class="form-label">动作</label>
                 <select class="form-select" id="kaAction" name="kaAction">
-                  <option value="1">蜂窝 UDP 流量（约48KB）</option>
+                  <option value="1">蜂窝 HTTP 下载 payload</option>
                   <option value="2">发送短信</option>
                   <option value="3">USSD 查询</option>
                 </select>
               </div>
             </div>
-            <div class="form-group"><label class="form-label">目标（短信号码 / USSD 码；流量保号时留空）</label><input class="form-input" type="text" id="kaTarget" name="kaTarget" placeholder="如 10086 或 *122#"></div>
+            <div class="form-group"><label class="form-label">保号 URL（HTTP 下载 payload）</label><input class="form-input" type="url" id="kaUrl" name="kaUrl" placeholder="http://gg.incrafttime.top/api/payload?size=64342"></div>
+            <div class="form-group"><label class="form-label">目标（短信号码 / USSD 码；HTTP保号时留空）</label><input class="form-input" type="text" id="kaTarget" name="kaTarget" placeholder="如 10086 或 *122#"></div>
           </div>
         </div>
         <div class="schedule-stack">
@@ -679,13 +676,13 @@ const char* htmlPage = R"rawliteral(
     <!-- ===== Diagnostics & Control ===== -->
     <div class="panel" id="panel-diagnose">
       <h1 class="page-title">诊断与控制</h1>
-      <p class="page-subtitle">执行蜂窝流量、USSD、重启、飞行模式等操作</p>
+      <p class="page-subtitle">执行蜂窝 payload 下载、USSD、重启、飞行模式等操作</p>
       <div class="card-grid">
         <div class="card">
-          <div class="card-header">蜂窝流量测试</div>
+          <div class="card-header">蜂窝 payload 测试</div>
           <div class="card-body">
-            <div class="at-bar"><input class="form-input" type="text" id="pingHost" value="223.5.5.5" placeholder="IP 或域名"><button class="btn btn-primary btn-sm" id="pingBtn" onclick="doPing()">发送约48KB</button></div>
-            <p class="form-hint">临时启用蜂窝数据(PDP)，向目标 UDP 端口发送约 48KB 上行数据，完成后自动关闭</p>
+            <div class="at-bar"><input class="form-input" type="url" id="pingUrl" placeholder="http://gg.incrafttime.top/api/payload?size=64342"><button class="btn btn-primary btn-sm" id="pingBtn" onclick="doPing()">下载 payload</button></div>
+            <p class="form-hint">临时启用蜂窝数据(PDP)，通过模组蜂窝网络下载 payload，完成后自动关闭</p>
             <div class="result-box" id="pingResult"></div>
           </div>
         </div>
@@ -920,17 +917,17 @@ const char* htmlPage = R"rawliteral(
         }).catch(function(e){ btn.disabled = false; r.className = 'result-box result-error'; r.textContent = '请求失败: ' + e; });
     }
 
-    // ---- UDP cellular traffic ----
+    // ---- Cellular HTTP payload traffic ----
     var pingPollTimer = null;
     function doPing(){
       var b=document.getElementById('pingBtn'),r=document.getElementById('pingResult');
-      var host=(document.getElementById('pingHost').value||'').trim()||'223.5.5.5';
+      var url=(document.getElementById('pingUrl').value||'').trim();
       b.disabled=true;b.textContent='...';
-      r.className='result-box result-loading';r.textContent='提交流量消耗任务...';
-      fetch('/ping',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'host='+encodeURIComponent(host)}).then(function(rr){return rr.json()}).then(function(d){
-        if(d.success && d.running){ r.textContent='后台发送约48KB中（会短暂开启蜂窝数据）...'; pollPingStatus(); }
-        else{ b.disabled=false;b.textContent='发送约48KB'; r.className='result-box result-error'; r.textContent=d.message||'任务启动失败'; }
-      }).catch(function(e){b.disabled=false;b.textContent='发送约48KB';r.className='result-box result-error';r.textContent='请求失败: '+e;});
+      r.className='result-box result-loading';r.textContent='提交 payload 下载任务...';
+      fetch('/ping',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)}).then(function(rr){return rr.json()}).then(function(d){
+        if(d.success && d.running){ r.textContent='后台下载 payload 中（会短暂开启蜂窝数据）...'; pollPingStatus(); }
+        else{ b.disabled=false;b.textContent='下载 payload'; r.className='result-box result-error'; r.textContent=d.message||'任务启动失败'; }
+      }).catch(function(e){b.disabled=false;b.textContent='下载 payload';r.className='result-box result-error';r.textContent='请求失败: '+e;});
     }
     function pollPingStatus(){
       if(pingPollTimer) clearTimeout(pingPollTimer);
@@ -938,16 +935,16 @@ const char* htmlPage = R"rawliteral(
         var b=document.getElementById('pingBtn'),r=document.getElementById('pingResult');
         if(d.running){
           r.className='result-box result-loading';
-          r.textContent='正在向 '+(d.host||'')+' 发送约48KB UDP 流量（后台执行，可刷新网页）...';
+          r.textContent='正在通过蜂窝网络下载 payload（后台执行，可刷新网页）...';
           pingPollTimer=setTimeout(pollPingStatus,1000);
           return;
         }
-        b.disabled=false;b.textContent='发送约48KB';
-        if(d.success){r.className='result-box result-success';r.textContent='UDP 流量发送完成 — '+(d.message||'完成');}
-        else{r.className='result-box result-error';r.textContent='UDP 流量发送失败 — '+(d.message||'无结果');}
+        b.disabled=false;b.textContent='下载 payload';
+        if(d.success){r.className='result-box result-success';r.textContent='payload 下载完成 — '+(d.message||'完成');}
+        else{r.className='result-box result-error';r.textContent='payload 下载失败 — '+(d.message||'无结果');}
       }).catch(function(e){
         var b=document.getElementById('pingBtn'),r=document.getElementById('pingResult');
-        b.disabled=false;b.textContent='发送约48KB';r.className='result-box result-error';r.textContent='状态查询失败: '+e;
+        b.disabled=false;b.textContent='下载 payload';r.className='result-box result-error';r.textContent='状态查询失败: '+e;
       });
     }
 
@@ -1065,12 +1062,20 @@ const char* htmlPage = R"rawliteral(
       });
     }
     // ---- Keep-Alive (保号) ----
+    function normalizeKaUrlForDisplay(url) {
+      url = url || '';
+      if (url.indexOf('gg.incrafttime.top/api/payload') >= 0) url = url.replace('size=128684', 'size=64342');
+      return url;
+    }
     function kaLoadStatus() {
       fetch('/keepalive?action=status').then(function(r){return r.json();}).then(function(d) {
         document.getElementById('kaEnabled').checked = !!d.enabled;
         document.getElementById('kaIntervalDays').value = d.intervalDays;
         document.getElementById('kaAction').value = d.action;
         document.getElementById('kaTarget').value = d.target || '';
+        var kaUrl = normalizeKaUrlForDisplay(d.url);
+        document.getElementById('kaUrl').value = kaUrl;
+        document.getElementById('pingUrl').value = kaUrl;
         var cd = document.getElementById('kaCountdown');
         if (!d.timeValid) cd.textContent = '时间未同步，倒计时暂不可用';
         else if (!d.lastTime) cd.textContent = '尚未建立基准日，启用后首次检查时建立';
@@ -1552,7 +1557,7 @@ const char* htmlPage = R"rawliteral(
       if (name === 'log') { refreshLog(); startLogPoll(); } else { stopLogPoll(); }   // 仅日志面板轮询
       if (name === 'overview') { loadStatus(); loadLatestOtp(); startStatusPoll(); } else { stopStatusPoll(); }
       if (name === 'inbox') loadMessages();
-      if (name === 'keepalive') kaLoadStatus();
+      if (name === 'keepalive' || name === 'diagnose') kaLoadStatus();
       if (name === 'sim') wifiPrefill();
       if (name === 'push') { parseFwdRules(); renderRules(); }
     };

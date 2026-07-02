@@ -62,8 +62,9 @@ struct Config {
   // ---- 保号定时任务（绝对日期，断电不忘）----
   bool kaEnabled;          // 是否启用保号
   int kaIntervalDays;      // 触发周期(天)，如 175(giffgaff 180 天前留余量)
-  uint8_t kaAction;        // 动作: 1=蜂窝UDP流量保号 2=发短信 3=USSD查询
-  String kaTarget;         // SMS 目标号码 或 USSD 码(UDP保号时忽略)
+  uint8_t kaAction;        // 动作: 1=蜂窝HTTP流量保号 2=发短信 3=USSD查询
+  String kaTarget;         // SMS 目标号码 或 USSD 码(HTTP保号时忽略)
+  String kaUrl;            // HTTP流量保号 URL(payload 文件；诊断页也默认使用)
   uint32_t kaLastTime;     // 上次保号动作的绝对 Unix 时间戳(持久化于 NVS)
   // ---- 时间/NTP ----
   int tzOffsetMin;         // 本地时区相对 UTC 的分钟偏移(默认 +480 = UTC+8)
@@ -81,7 +82,8 @@ struct Config {
 };
 
 // 保号动作类型
-#define KA_ACTION_PING 1
+#define KA_ACTION_HTTP 1
+#define KA_ACTION_PING KA_ACTION_HTTP  // 兼容旧代码/旧配置名：值不变，仅语义从 UDP 改为 HTTP
 #define KA_ACTION_SMS  2
 #define KA_ACTION_USSD 3
 
@@ -120,15 +122,15 @@ struct Config {
 #define MODEM_POWERUP_MIN_MS     1500     // 上电最小安定延时；之后轮询 AT 探活，应答即提前结束(省 3-4s/开机)
 #define MODEM_INIT_AT_RETRIES    10       // modemInit AT 握手单轮重试次数
 #define MODEM_INIT_CMD_RETRIES   5        // modemInit 其它配置命令重试次数
-#define CELLULAR_BURN_BYTES      (48UL * 1024UL)  // giffgaff 中国约 20p/MB，48KiB≈0.98p；小于50KB仍能建立计费数据连接
-#define CELLULAR_BURN_MAX_BYTES  (48UL * 1024UL)  // 硬上限：避免误把流量打得更大
-#define CELLULAR_BURN_MIPSEND_BYTES (48UL * 1024UL)  // 单次 MIPSEND 发送大小，低于 UDP 65535 字节上限
-#define CELLULAR_BURN_DEFAULT_HOST "223.5.5.5"    // 默认 UDP 目标：阿里公共 DNS
+#define CELLULAR_KEEPALIVE_DEFAULT_URL "http://gg.incrafttime.top/api/payload?size=64342"
+#define CELLULAR_KEEPALIVE_MIN_BYTES   (48UL * 1024UL)  // 默认 payload 约 63KB；低于此值视为未达到保号流量
+#define CELLULAR_HTTP_TIMEOUT_MS       90000UL          // 蜂窝 HTTP 下载最长等待；含 DNS/HTTPS/漫游网络抖动
+#define CELLULAR_PDP_READY_TIMEOUT_MS  12000UL          // CGACT 返回 OK 后继续等 PDP 拿到有效 IP，再发起 MHTTP
 #define HTTP_CONNECT_TIMEOUT_MS  1500     // 推送 HTTP 连接超时：坏通道快速释放 worker，降低网页卡顿
 #define HTTP_READ_TIMEOUT_MS     2500     // 推送 HTTP 读超时，避免慢 Webhook 长时间占住 worker
 // 推送/邮件/测试三类慢任务已移到后台 worker(见 push.cpp::pushWorkerTask)，loop 不再被其阻塞，
 // 故原 FORWARD_WEB_GRACE_MS / PUSH_JOB_GAP_MS 人为节流已删除(worker 单任务串行天然限速)。
-// SLOW_WORK_WEB_GRACE_MS 仍保留：供 loop 线程上的保号/网页发短信/诊断UDP 在网页活跃后短暂避让模组AT。
+// SLOW_WORK_WEB_GRACE_MS 仍保留：供 loop 线程上的保号/网页发短信/诊断HTTP 在网页活跃后短暂避让模组AT。
 #define SLOW_WORK_WEB_GRACE_MS   1500UL   // 刚处理过网页请求后，loop 上的模组类慢任务暂缓，给SPA留窗口
 #define SLOW_WORK_MAX_DEFER_MS   10000UL  // 但单个慢任务被避让的上限：超过即强制执行，防 SPA 持续轮询饿死保号/网页发短信
 #define TLS_MIN_FREE_HEAP        50000UL  // 发起 TLS(SMTP/HTTPS) 前要求的最小可分配堆(worker与网页并发，留余量)

@@ -20,18 +20,20 @@ static KeepAliveJob kaJob;
 
 static void schedulerPumpWebDuringWait() { pumpWebDuringWait(); }  // 统一实现见 globals.h
 
-// 保号动作：激活数据连接 + 发送固定字节 UDP 上行，再关闭 PDP 省流量。
-// giffgaff 中国漫游约 20p/MB，48KiB 用户数据约 0.98p；固定上行比小 HTTP 首页更可控。
-static bool keepAliveDataPing() {
+// 保号动作：激活数据连接 + 通过模组蜂窝 HTTP 下载 payload，再关闭 PDP 省流量。
+// 参考 gg-keeper：用带随机参数的 payload 下载制造真实蜂窝流量，URL 可在网页配置。
+static bool keepAliveHttpFetch() {
   logCaptureLn("保号: 激活数据连接(CGACT=1)...");
   String r = sendATCommand("AT+CGACT=1,1", 10000);
   bool active = (r.indexOf("OK") >= 0);
-  unsigned long stableStart = millis();
-  while (millis() - stableStart < 500) schedulerPumpWebDuringWait();
-  bool ok = active && consumeCellularDataBytes(CELLULAR_BURN_BYTES, CELLULAR_BURN_DEFAULT_HOST, 53);
-  if (ok) logCaptureF("保号: 已发送约 %luKB 蜂窝 UDP 上行流量\n",
-                      (unsigned long)(CELLULAR_BURN_BYTES / 1024UL));
-  else logCaptureLn("保号: UDP 流量保号失败");
+  bool ready = active && waitCellularPdpReady();
+  unsigned long bytes = 0;
+  int status = -1;
+  bool ok = ready && fetchCellularKeepAliveUrl(config.kaUrl, &bytes, &status);
+  if (ok) logCaptureF("保号: 已通过蜂窝HTTP下载约 %luKB payload\n",
+                      (unsigned long)(bytes / 1024UL));
+  else logCaptureF("保号: HTTP payload 保号失败(HTTP %d, %luKB)\n",
+                   status, (unsigned long)(bytes / 1024UL));
   // 仅在用户未启用蜂窝数据时关闭 PDP 省流量；若用户已在 SIM 页开启数据，保留其连接不误关。
   if (!config.dataEnabled) sendATCommand("AT+CGACT=0,1", 5000);
   return ok;
@@ -59,9 +61,9 @@ bool keepAliveRunNow() {
     case KA_ACTION_USSD:
       ok = keepAliveUssd(config.kaTarget);
       break;
-    case KA_ACTION_PING:
+    case KA_ACTION_HTTP:
     default:
-      ok = keepAliveDataPing();
+      ok = keepAliveHttpFetch();
       break;
   }
   uint32_t now = (uint32_t)time(nullptr);
@@ -201,6 +203,7 @@ String keepAliveStatusJson() {
   j += "\"intervalDays\":"; j += String(config.kaIntervalDays); j += ",";
   j += "\"action\":"; j += String((int)config.kaAction); j += ",";
   j += "\"target\":\""; j += jsonEscape(config.kaTarget); j += "\",";
+  j += "\"url\":\""; j += jsonEscape(config.kaUrl); j += "\",";
   j += "\"lastTime\":"; j += String(config.kaLastTime); j += ",";
   long daysLeft = -1;
   if (epochIsValid(now) && config.kaLastTime > 0) {

@@ -23,7 +23,7 @@ void handleFlightMode();
 void handleATCommand();
 void handleSendSms();
 void handlePing();
-void processPingJob();    // 诊断 UDP 流量后台任务，避免 /ping HTTP handler 长时间阻塞网页刷新
+void processPingJob();    // 诊断蜂窝 HTTP payload 后台任务，避免 /ping HTTP handler 长时间阻塞网页刷新
 void handleLog();
 void handleModem();
 void handleWifi();

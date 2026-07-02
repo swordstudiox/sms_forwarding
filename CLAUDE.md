@@ -107,12 +107,10 @@ Key flows:
   `/flight`,`/at`,`/log`(streamed, `?since=` cursor),`/modem`,`/wifi`,`/status`(health JSON),
   `/keepalive`,`/testpush`,`/ussd`. Sidebar icons are inline SVG (no emoji).
 - **Scheduler** (`scheduler.cpp`): E0 SIM keep-alive — absolute-date (NVS `kaLastTime`), power-loss
-  safe; action = data-traffic/SMS/USSD; `keepAliveTick()` in loop, `/keepalive?action=status|run|reset`.
-  The data-traffic action (`kaAction==1`) does an **HTTP GET to `www.baidu.com`** over the modem TCP
-  socket (`consumeCellularViaHttpGet()` in `modem.cpp`: `AT+CGACT=1,1` → `MIPOPEN TCP :80` → `MIPSEND`
-  the GET → drain the `+MIPURC:"rtcp"` downlink response = billable traffic → `MIPCLOSE` → `CGACT=0`).
-  This replaced the old ~45KB UDP burn (a real HTTP data session is more reliably counted as 动账). The
-  separate `/ping` web diagnostic still uses the UDP burn (`consumeCellularDataBytes`).
+  safe; action = cellular HTTP payload/SMS/USSD; `keepAliveTick()` in loop,
+  `/keepalive?action=status|run|reset`. The data-traffic action (`kaAction==1`) downloads the
+  configured `config.kaUrl` payload over the modem PDP context via `AT+MHTTP*`; the diagnostics
+  `/ping` route uses the same operation and can override the URL for one run.
 - **Config** (`config.cpp`): persisted to NVS via `Preferences`, namespace `sms_config`.
   `loadConfig()` migrates legacy single-channel keys (`httpUrl`, `barkMode`) into `pushChannels[0]`.
   New keys are additive with defaults (zero-migration). Tunable defaults (timeouts, queue size,

@@ -379,12 +379,12 @@ HTTP Basic Authentication，账号密码来自 `config.webUser` / `config.webPas
 ---
 
 ### `void handlePing()` / `processPingJob()`
-网页“蜂窝 UDP 流量”诊断。`handlePing()` 只启动/查询后台任务并立即返回；真正流量在 loop 的 `processPingJob()` 执行：
+网页“蜂窝 HTTP payload”诊断。`handlePing()` 只启动/查询后台任务并立即返回；真正流量在 loop 的 `processPingJob()` 执行：
 1. `AT+CGACT=1,1` 激活数据连接
-2. `consumeCellularDataBytes()`：`AT+MIPOPEN` UDP socket → `AT+MIPSEND` 发送约 48KB 上行 → `AT+MIPCLOSE`
+2. `fetchCellularKeepAliveUrl()`：`AT+MHTTPCREATE` → `AT+MHTTPREQUEST` → 统计 `+MHTTPURC:"content"` 下载字节
 3. `AT+CGACT=0,1` 关闭数据连接
 
-`?action=status` 轮询进度。流量保号复用同一固定字节 UDP 路径，便于按运营商每 MB 资费估算扣费。
+`?action=status` 轮询进度。流量保号复用同一 payload URL，URL 保存在 `config.kaUrl`，诊断可临时覆盖。
 
 ---
 
@@ -397,7 +397,7 @@ HTTP Basic Authentication，账号密码来自 `config.webUser` / `config.webPas
 | `GET /status` | `handleStatus()` | 健康状态 JSON（版本/信号/堆水位/各队列深度/统计/复位原因/时间） |
 | `GET /messages` | `handleMessages()` | 收件箱/已发送 JSON（`?box=sent`），流式分块输出 |
 | `POST /resend` `POST /delete` | `handleResend()` / `handleDeleteMsg()` | 重发/删除收件箱某条（`?id=`） |
-| `GET /keepalive` | `handleKeepAlive()` | 保号：`?action=status\|run\|reset`；`run` 入队由 loop 执行（默认动作 = 约 48KB UDP 上行流量） |
+| `GET /keepalive` | `handleKeepAlive()` | 保号：`?action=status\|run\|reset`；`run` 入队由 loop 执行（默认动作 = 蜂窝 HTTP payload 下载） |
 | `GET /testpush` | `handleTestPush()` | 通道测试：`?ch=` 入队，`?action=status` 轮询；真实发送在 worker |
 | `GET /ussd` | `handleUssd()` | USSD 查询（`AT+CUSD`，同步最长 ~20s） |
 | `GET /modem` `GET /wifi` `GET /wifiscan` `POST /wificonfig` | — | 模组信息 / WiFi 状态 / 扫描 / 保存并重启接入 |

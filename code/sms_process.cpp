@@ -650,7 +650,7 @@ void drainPendingSmsUrc(unsigned long maxWaitMs) {
 }
 
 // 有些 AT 响应等待期间会混入 +CMT/PDU。调用方虽然已把字节读走，但这里再按行提取，
-// 避免"网页查信号/USSD/UDP诊断 时刚好来短信"导致 URC 被当作普通响应吞掉。
+// 避免"网页查信号/USSD/HTTP诊断 时刚好来短信"导致 URC 被当作普通响应吞掉。
 int processSmsUrcText(const String& text) {
   int processed = 0;
   bool waitPdu = (smsUrcState == SMS_URC_WAIT_PDU);

@@ -102,7 +102,7 @@ checkAuth()               [web_handlers.cpp]
     GET  /sms      → handleRoot()        兼容旧链接，返回同一 SPA 页面
     POST /save     → handleSave()        保存配置 → saveConfig()（快速返回，不发通知邮件）
     POST /sendsms  → handleSendSms()     网页发送短信 → 入队 → loop 异步 sendSMS()
-    POST /ping     → handlePing()        诊断: AT+CGACT=1 → MIPOPEN/MIPSEND UDP 流量 → CGACT=0
+    POST /ping     → handlePing()        诊断: AT+CGACT=1 → MHTTP 下载 payload → CGACT=0
     GET  /flight   → handleFlightMode()  AT+CFUN 查询/切换飞行模式
     GET  /at       → handleATCommand()   透传 AT 指令到模组
     GET  /log      → handleLog()         返回环形缓冲区日志 (JSON 数组)

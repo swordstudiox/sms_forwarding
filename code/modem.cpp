@@ -3,6 +3,7 @@
 #include "inbox.h"
 #include "sms_process.h"
 #include "push.h"
+#include <esp_system.h>
 
 static bool modemSerialBusy = false;
 
@@ -622,110 +623,319 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   return ok;
 }
 
-static bool sendUdpDataChunk(uint16_t len) {
-  if (!beginModemSerialOp("发送UDP流量数据")) return false;
-  if (!drainSerial1PreservingSms("发送UDP流量数据")) {
-    endModemSerialOp();
+static char hexNibble(uint8_t v) {
+  v &= 0x0F;
+  return v < 10 ? (char)('0' + v) : (char)('A' + v - 10);
+}
+
+static String hexEncodeAscii(const String& s) {
+  String out;
+  out.reserve(s.length() * 2);
+  for (unsigned i = 0; i < s.length(); i++) {
+    uint8_t b = (uint8_t)s.charAt(i);
+    out += hexNibble(b >> 4);
+    out += hexNibble(b);
+  }
+  return out;
+}
+
+static bool parseHttpUrl(const String& rawUrl, String& protocol, String& host, String& path) {
+  String url = rawUrl;
+  url.trim();
+  if (url.length() == 0) url = CELLULAR_KEEPALIVE_DEFAULT_URL;
+  if (url.length() > 240) {
+    logCaptureLn("蜂窝HTTP URL过长");
     return false;
   }
-  Serial1.print("AT+MIPSEND=0,");
-  Serial1.println(len);
+  int protoEnd = url.indexOf("://");
+  if (protoEnd <= 0) {
+    logCaptureLn("蜂窝HTTP URL格式无效，需要 http:// 或 https://");
+    return false;
+  }
+  protocol = url.substring(0, protoEnd);
+  protocol.toLowerCase();
+  if (protocol != "http" && protocol != "https") {
+    logCaptureLn("蜂窝HTTP URL仅支持 http/https");
+    return false;
+  }
 
+  int hostStart = protoEnd + 3;
+  int pathStart = url.indexOf('/', hostStart);
+  if (pathStart < 0) {
+    host = url.substring(hostStart);
+    path = "/";
+  } else {
+    host = url.substring(hostStart, pathStart);
+    path = url.substring(pathStart);
+  }
+  int hash = path.indexOf('#');
+  if (hash >= 0) path.remove(hash);
+  host.trim();
+  if (host.length() == 0 || host.indexOf('"') >= 0 || host.indexOf(' ') >= 0 ||
+      path.indexOf('"') >= 0 || path.indexOf(' ') >= 0) {
+    logCaptureLn("蜂窝HTTP URL包含非法字符");
+    return false;
+  }
+  return true;
+}
+
+static String appendNoCacheQuery(String path) {
+  path += (path.indexOf('?') >= 0) ? '&' : '?';
+  path += "t=";
+  path += String((unsigned long)millis());
+  path += "&r=";
+  path += String((uint32_t)esp_random(), HEX);
+  return path;
+}
+
+static void normalizeKeepAlivePayloadSize(String& host, String& path) {
+  if (host != "gg.incrafttime.top") return;
+  if (!path.startsWith("/api/payload?")) return;
+  path.replace("size=128684", "size=64342");
+}
+
+static String sendATCommandBusy(const String& cmd, unsigned long timeout, unsigned long extraReadMs = 50) {
+  Serial1.println(cmd);
   unsigned long start = millis();
-  bool gotPrompt = false;
-  while (millis() - start < 5000) {
-    if (Serial1.available()) {
-      char c = Serial1.read();
-      if (c == '>') { gotPrompt = true; break; }
-    }
-    pumpWebServerDuringWait();
-  }
-  if (!gotPrompt) {
-    logCaptureLn("MIPSEND 未收到 > 提示符");
-    endModemSerialOp();
-    return false;
-  }
-
-  static const char payload[128] = {
-    'A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
-    'A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
-    'A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
-    'A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
-    'A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
-    'A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
-    'A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A',
-    'A','A','A','A','A','A','A','A','A','A','A','A','A','A','A','A'
-  };
-  uint16_t left = len;
-  while (left > 0) {
-    uint16_t n = left > sizeof(payload) ? sizeof(payload) : left;
-    Serial1.write((const uint8_t*)payload, n);
-    left -= n;
-    yield();
-  }
-
-  start = millis();
   String resp;
-  while (millis() - start < 8000) {
+  while (millis() - start < timeout) {
     while (Serial1.available()) {
       char c = Serial1.read();
-      resp += c;
-      if (resp.indexOf("OK") >= 0) {
-        endModemSerialOp();
+      if (resp.length() < 900) resp += c;
+      if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
+        unsigned long t = millis();
+        while (millis() - t < extraReadMs) {
+          while (Serial1.available()) {
+            char e = Serial1.read();
+            if (resp.length() < 1200) resp += e;
+            t = millis();
+          }
+          pumpWebServerDuringWait();
+        }
         processSmsUrcText(resp);
-        return true;
-      }
-      if (resp.indexOf("ERROR") >= 0) {
-        endModemSerialOp();
-        processSmsUrcText(resp);
-        return false;
+        return resp;
       }
     }
     pumpWebServerDuringWait();
   }
-  endModemSerialOp();
   processSmsUrcText(resp);
-  logCaptureLn("MIPSEND 响应超时");
+  return resp;
+}
+
+static int parseMhttpCreateId(const String& resp) {
+  int p = resp.indexOf("+MHTTPCREATE:");
+  if (p < 0) return -1;
+  p += 13;
+  while (p < (int)resp.length() && !isDigit((unsigned char)resp.charAt(p)) && resp.charAt(p) != '-') p++;
+  if (p >= (int)resp.length()) return -1;
+  return resp.substring(p).toInt();
+}
+
+static bool sendMhttpHeaderBusy(int httpId, bool more, const String& line) {
+  String cmd = String("AT+MHTTPHEADER=") + String(httpId) + "," + (more ? "1" : "0") +
+               "," + String(line.length()) + ",\"" + line + "\"";
+  String resp = sendATCommandBusy(cmd, 3000, 50);
+  return resp.indexOf("OK") >= 0;
+}
+
+static bool parseCommaLongs(const String& s, long* values, int maxValues, int& count) {
+  count = 0;
+  int start = 0;
+  while (start < (int)s.length() && count < maxValues) {
+    int comma = s.indexOf(',', start);
+    String part = (comma < 0) ? s.substring(start) : s.substring(start, comma);
+    part.trim();
+    if (part.length() > 0 && (isDigit((unsigned char)part.charAt(0)) || part.charAt(0) == '-')) {
+      values[count++] = part.toInt();
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  return count > 0;
+}
+
+static void parseMhttpHead(const String& head, int httpId, unsigned long& bytesRead,
+                           unsigned long& expectedBytes, int& statusCode,
+                           int& mhttpError, bool& complete, bool& error) {
+  if (head.startsWith("+MHTTPURC: \"header\"")) {
+    long nums[4]; int n = 0;
+    if (parseCommaLongs(head.substring(head.indexOf(',') + 1), nums, 4, n) && n >= 2 &&
+        nums[0] == httpId) {
+      statusCode = (int)nums[1];
+      logCaptureF("蜂窝HTTP响应状态: %d\n", statusCode);
+    }
+  } else if (head.startsWith("+MHTTPURC: \"content\"")) {
+    long nums[5]; int n = 0;
+    if (parseCommaLongs(head.substring(head.indexOf(',') + 1), nums, 5, n) && n >= 4 &&
+        nums[0] == httpId) {
+      expectedBytes = (unsigned long)nums[1];
+      bytesRead = (unsigned long)nums[2];
+      unsigned long cur = (unsigned long)nums[3];
+      if ((expectedBytes > 0 && bytesRead >= expectedBytes) || cur == 0) complete = true;
+    }
+  } else if (head.startsWith("+MHTTPURC: \"err\"")) {
+    long nums[3]; int n = 0;
+    if (parseCommaLongs(head.substring(head.indexOf(',') + 1), nums, 3, n) && n >= 2 &&
+        nums[0] == httpId) {
+      mhttpError = (int)nums[1];
+      logCaptureF("蜂窝HTTP错误码: %ld%s\n", nums[1],
+                  mhttpError == 4 ? "(SSL握手失败)" : "");
+      error = true;
+      complete = true;
+    }
+  }
+}
+
+bool waitCellularPdpReady(unsigned long timeout) {
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    String r = sendATCommand("AT+CGPADDR=1", 3000);
+    int c = r.indexOf("+CGPADDR:");
+    if (c >= 0) {
+      int comma = r.indexOf(',', c);
+      int eol = r.indexOf('\n', c); if (eol < 0) eol = r.length();
+      if (comma >= 0 && comma < eol) {
+        String ip = r.substring(comma + 1, eol);
+        ip.replace("\"", "");
+        ip.trim();
+        if (ip.length() >= 7 && ip != "0.0.0.0") {
+          modemCellIp = ip;
+          logCaptureLn(String("蜂窝PDP已就绪，IP: ") + ip);
+          return true;
+        }
+      }
+    }
+    unsigned long gap = millis();
+    while (millis() - gap < 700) pumpWebServerDuringWait();
+  }
+  logCaptureLn("蜂窝PDP等待超时：未取得有效IP");
   return false;
 }
 
-bool consumeCellularDataBytes(unsigned long targetBytes, const char* host, uint16_t port) {
-  if (targetBytes == 0) return true;
-  if (!host || !host[0]) host = CELLULAR_BURN_DEFAULT_HOST;
-  if (port == 0) port = 53;
-  if (targetBytes > CELLULAR_BURN_MAX_BYTES) {
-    logCaptureF("蜂窝UDP发送字节数 %lu 超过上限 %lu，已按上限执行\n",
-                targetBytes, (unsigned long)CELLULAR_BURN_MAX_BYTES);
-    targetBytes = CELLULAR_BURN_MAX_BYTES;
-  }
+static bool waitMhttpDownload(int httpId, unsigned long timeout, unsigned long& bytesRead,
+                              unsigned long& expectedBytes, int& statusCode, int& mhttpError) {
+  unsigned long start = millis();
+  String head;
+  head.reserve(180);
+  bool skippingData = false;
+  bool complete = false;
+  bool error = false;
+  while (millis() - start < timeout && !complete) {
+    while (Serial1.available() && !complete) {
+      char c = Serial1.read();
+      if (skippingData) {
+        if (c == '\n') {
+          skippingData = false;
+          head = "";
+        }
+        continue;
+      }
+      if (c == '\r' || c == '\n') {
+        if (head.startsWith("+MHTTPURC: \"err\"")) {
+          parseMhttpHead(head, httpId, bytesRead, expectedBytes, statusCode, mhttpError, complete, error);
+        }
+        head = "";
+        continue;
+      }
+      if (head.length() < 260) head += c;
 
-  logCaptureF("准备发送蜂窝UDP流量: 目标约 %lu 字节 -> %s:%u\n",
-              targetBytes, host, (unsigned)port);
-  sendATCommand("AT+MIPCLOSE=0", 2000);  // 清理旧 socket；失败也可继续
-  String openCmd = String("AT+MIPOPEN=0,\"UDP\",\"") + host + "\"," + String(port);
-  String openResp = sendATCommand(openCmd.c_str(), 10000);
-  if (openResp.indexOf("OK") < 0) {
-    logCaptureLn(String("打开 UDP socket 失败: ") + openResp);
+      int needCommas = 0;
+      if (head.startsWith("+MHTTPURC: \"content\"")) needCommas = 5;
+      else if (head.startsWith("+MHTTPURC: \"header\"")) needCommas = 4;
+      if (needCommas > 0) {
+        int commas = 0;
+        for (unsigned i = 0; i < head.length(); i++) if (head.charAt(i) == ',') commas++;
+        if (commas >= needCommas) {
+          parseMhttpHead(head, httpId, bytesRead, expectedBytes, statusCode, mhttpError, complete, error);
+          skippingData = true;  // 后面是 header/content 的 HEX 数据，直接排空，避免占堆
+        }
+      }
+    }
+    pumpWebServerDuringWait();
+  }
+  if (!complete) logCaptureLn("蜂窝HTTP下载等待超时");
+  return !error && complete && statusCode >= 200 && statusCode < 400 &&
+         bytesRead >= CELLULAR_KEEPALIVE_MIN_BYTES;
+}
+
+static bool fetchCellularKeepAliveParsed(const String& protocol, const String& host, const String& path,
+                                         unsigned long* bytesRead, int* httpStatus, int* mhttpError) {
+  if (bytesRead) *bytesRead = 0;
+  if (httpStatus) *httpStatus = -1;
+  if (mhttpError) *mhttpError = 0;
+  logCaptureF("准备通过蜂窝HTTP下载保号payload: %s://%s%s\n",
+              protocol.c_str(), host.c_str(), path.c_str());
+
+  if (!beginModemSerialOp("蜂窝HTTP保号")) return false;
+  if (!drainSerial1PreservingSms("蜂窝HTTP保号")) {
+    endModemSerialOp();
     return false;
   }
 
-  if (targetBytes > 65535UL) {
-    logCaptureLn("蜂窝UDP单次发送超过 MIPSEND 长度上限，已取消");
-    sendATCommand("AT+MIPCLOSE=0", 3000);
-    return false;
-  }
-  if (targetBytes != CELLULAR_BURN_MIPSEND_BYTES) {
-    logCaptureF("蜂窝UDP本次按单次 MIPSEND 发送 %lu 字节\n", targetBytes);
-  }
-  if (!sendUdpDataChunk((uint16_t)targetBytes)) {
-    logCaptureF("蜂窝UDP单次发送失败: %lu 字节\n", targetBytes);
-    sendATCommand("AT+MIPCLOSE=0", 3000);
+  for (int i = 0; i < 4; i++) sendATCommandBusy(String("AT+MHTTPDEL=") + String(i), 1000, 10);
+
+  String createCmd = String("AT+MHTTPCREATE=\"") + protocol + "://" + host + "\"";
+  String createResp = sendATCommandBusy(createCmd, 10000, 1200);
+  int httpId = parseMhttpCreateId(createResp);
+  if (httpId < 0) {
+    logCaptureLn(String("蜂窝HTTP创建失败: ") + createResp);
+    endModemSerialOp();
     return false;
   }
 
-  sendATCommand("AT+MIPCLOSE=0", 3000);
-  logCaptureF("蜂窝UDP发送完成: 约 %lu 字节\n", targetBytes);
-  return true;
+  if (protocol == "https") {
+    sendATCommandBusy(String("AT+MHTTPCFG=\"ssl\",") + String(httpId) + ",1,0", 5000, 50);
+  }
+  sendATCommandBusy(String("AT+MHTTPCFG=\"encoding\",") + String(httpId) + ",0,0", 3000, 50);
+  sendMhttpHeaderBusy(httpId, true, "Cache-Control: no-cache, no-store, must-revalidate");
+  sendMhttpHeaderBusy(httpId, false, "Pragma: no-cache");
+  sendATCommandBusy(String("AT+MHTTPCFG=\"encoding\",") + String(httpId) + ",1,1", 3000, 50);
+
+  String reqCmd = String("AT+MHTTPREQUEST=") + String(httpId) + ",1,0," + hexEncodeAscii(path);
+  String reqResp = sendATCommandBusy(reqCmd, 10000, 50);
+  if (reqResp.indexOf("OK") < 0) {
+    logCaptureLn(String("蜂窝HTTP请求发送失败: ") + reqResp);
+    sendATCommandBusy(String("AT+MHTTPDEL=") + String(httpId), 2000, 20);
+    endModemSerialOp();
+    return false;
+  }
+
+  unsigned long got = 0, expected = 0;
+  int status = -1;
+  int err = 0;
+  bool ok = waitMhttpDownload(httpId, CELLULAR_HTTP_TIMEOUT_MS, got, expected, status, err);
+  sendATCommandBusy(String("AT+MHTTPDEL=") + String(httpId), 3000, 20);
+  endModemSerialOp();
+
+  if (bytesRead) *bytesRead = got;
+  if (httpStatus) *httpStatus = status;
+  if (mhttpError) *mhttpError = err;
+  if (ok) {
+    logCaptureF("蜂窝HTTP保号完成: HTTP %d, 已下载约 %luKB\n",
+                status, (unsigned long)(got / 1024UL));
+  } else {
+    logCaptureF("蜂窝HTTP保号失败: HTTP %d, 已下载约 %luKB/期望%luKB\n",
+                status, (unsigned long)(got / 1024UL), (unsigned long)(expected / 1024UL));
+  }
+  return ok;
+}
+
+bool fetchCellularKeepAliveUrl(const String& url, unsigned long* bytesRead, int* httpStatus) {
+  if (bytesRead) *bytesRead = 0;
+  if (httpStatus) *httpStatus = -1;
+
+  String protocol, host, path;
+  if (!parseHttpUrl(url, protocol, host, path)) return false;
+  normalizeKeepAlivePayloadSize(host, path);
+  path = appendNoCacheQuery(path);
+
+  int mhttpError = 0;
+  bool ok = fetchCellularKeepAliveParsed(protocol, host, path, bytesRead, httpStatus, &mhttpError);
+  if (!ok && protocol == "https" && mhttpError == 4) {
+    logCaptureLn("HTTPS握手失败，改用HTTP重试一次；若返回301，请在ESA关闭强制HTTPS跳转");
+    ok = fetchCellularKeepAliveParsed("http", host, path, bytesRead, httpStatus, &mhttpError);
+  }
+  return ok;
 }
 
 // ---- 网页端待发短信队列 ----

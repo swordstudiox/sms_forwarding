@@ -20,13 +20,13 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout);
 bool waitCEREG();
 void blink_short(unsigned long gap_time = 500);
 bool sendSMS(const char* phoneNumber, const char* message);
+bool waitCellularPdpReady(unsigned long timeout = CELLULAR_PDP_READY_TIMEOUT_MS);
 bool enqueueOutgoingSms(const char* phoneNumber, const char* message);
 void processOutgoingSmsQueue();
 int outgoingSmsQueueDepth();
 bool modemSerialTryBegin(const char* label);  // 自定义AT等待流程使用：进入独占串口区
 void modemSerialEnd();                        // 自定义AT等待流程使用：退出独占串口区
-bool consumeCellularDataBytes(unsigned long targetBytes,
-                              const char* host = CELLULAR_BURN_DEFAULT_HOST,
-                              uint16_t port = 53);  // PDP 已激活时发送 UDP 上行数据；内部硬限制不超过 CELLULAR_BURN_MAX_BYTES
+bool fetchCellularKeepAliveUrl(const String& url, unsigned long* bytesRead = nullptr,
+                               int* httpStatus = nullptr); // PDP 已激活时通过模组蜂窝 HTTP GET 下载 payload
 
 #endif

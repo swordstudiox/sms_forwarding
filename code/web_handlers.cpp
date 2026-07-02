@@ -469,7 +469,7 @@ struct PingJob {
   bool running;
   bool done;
   bool success;
-  String host;
+  String url;
   String message;
   unsigned long startedMs;
 };
@@ -477,14 +477,15 @@ static PingJob pingJob;
 
 static void pumpWebDuringBackgroundWait() { pumpWebDuringWait(); }  // 统一实现见 globals.h
 
-static bool pingHostValid(const String& pingHost, String& err) {
-  if (pingHost.length() > 64) { err = "目标地址过长"; return false; }
-  for (unsigned i = 0; i < pingHost.length(); i++) {
-    char c = pingHost.charAt(i);
-    if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == ':')) {
-      err = "目标地址含非法字符";
-      return false;
-    }
+static bool keepAliveUrlValid(const String& url, String& err) {
+  if (url.length() > 240) { err = "URL过长"; return false; }
+  if (!(url.startsWith("http://") || url.startsWith("https://"))) {
+    err = "URL需要以 http:// 或 https:// 开头";
+    return false;
+  }
+  if (url.indexOf('"') >= 0 || url.indexOf(' ') >= 0) {
+    err = "URL包含非法字符";
+    return false;
   }
   return true;
 }
@@ -501,8 +502,8 @@ void processPingJob() {
   if (smsUrcReceiving()) return;
   if (millis() - pingJob.startedMs < SLOW_WORK_WEB_GRACE_MS) return;  // 先让 /ping 响应和紧随其后的刷新出去
 
-  String host = pingJob.host;
-  logCaptureLn(String("后台蜂窝UDP流量发送开始: ") + host);
+  String url = pingJob.url;
+  logCaptureLn(String("后台蜂窝HTTP payload 下载开始: ") + url);
 
   logCaptureLn("激活数据连接(CGACT)...");
   String activateResp = sendATCommand("AT+CGACT=1,1", 10000);
@@ -514,16 +515,26 @@ void processPingJob() {
   drainPendingSmsUrc(3000);
   if (smsUrcReceiving()) {
     sendATCommand("AT+CGACT=0,1", 5000);
-    finishPingJob(false, "短信接收中，UDP流量发送已取消");
+    finishPingJob(false, "短信接收中，HTTP下载已取消");
     return;
   }
 
-  unsigned long stableStart = millis();
-  while (millis() - stableStart < 500) pumpWebDuringBackgroundWait();
+  bool pdpReady = waitCellularPdpReady();
+  if (!pdpReady) {
+    if (!config.dataEnabled) {
+      logCaptureLn("关闭PDP上下文(CGACT=0)...");
+      String deactivateResp = sendATCommand("AT+CGACT=0,1", 5000);
+      logCaptureLn(String("CGACT关闭响应: " + deactivateResp));
+    }
+    finishPingJob(false, "蜂窝PDP未取得有效IP，请查看日志");
+    return;
+  }
 
-  bool ok = consumeCellularDataBytes(CELLULAR_BURN_BYTES, host.c_str(), 53);
-  String msg = ok ? (String("已发送约 ") + String((unsigned long)(CELLULAR_BURN_BYTES / 1024UL)) + "KB UDP 蜂窝上行数据")
-                  : "蜂窝UDP流量发送失败，请查看日志";
+  unsigned long bytes = 0;
+  int status = -1;
+  bool ok = fetchCellularKeepAliveUrl(url, &bytes, &status);
+  String msg = ok ? (String("HTTP ") + String(status) + "，已通过蜂窝下载约 " + String((unsigned long)(bytes / 1024UL)) + "KB payload")
+                  : (String("蜂窝HTTP payload 下载失败(HTTP ") + String(status) + "，" + String((unsigned long)(bytes / 1024UL)) + "KB)，请查看日志");
 
   // 仅在用户未启用蜂窝数据时关闭 PDP；用户已开启数据则保留连接，不因一次诊断而误关。
   if (!config.dataEnabled) {
@@ -535,7 +546,7 @@ void processPingJob() {
   finishPingJob(ok, msg);
 }
 
-// 处理蜂窝 UDP 流量请求：只启动/查询后台任务，避免HTTP handler长时间占住WebServer
+// 处理蜂窝 HTTP payload 流量请求：只启动/查询后台任务，避免HTTP handler长时间占住WebServer
 void handlePing() {
   if (!checkAuth()) return;
 
@@ -543,38 +554,40 @@ void handlePing() {
     String j = String("{\"running\":") + (pingJob.running ? "true" : "false") +
                ",\"done\":" + (pingJob.done ? String("true") : String("false")) +
                ",\"success\":" + (pingJob.success ? String("true") : String("false")) +
-               ",\"host\":\"" + jsonEscape(pingJob.host) + "\"" +
+               ",\"url\":\"" + jsonEscape(pingJob.url) + "\"" +
                ",\"message\":\"" + jsonEscape(pingJob.message) + "\"}";
     server.send(200, "application/json", j);
     return;
   }
 
   if (pingJob.running) {
-    server.send(200, "application/json", "{\"success\":false,\"running\":true,\"message\":\"UDP流量正在发送，请稍候\"}");
+    server.send(200, "application/json", "{\"success\":false,\"running\":true,\"message\":\"HTTP payload 正在下载，请稍候\"}");
     return;
   }
 
-  String pingHost = server.arg("host");
-  pingHost.trim();
-  if (pingHost.length() == 0) pingHost = CELLULAR_BURN_DEFAULT_HOST;
+  String pingUrl = server.arg("url");
+  pingUrl.trim();
+  if (pingUrl.length() == 0) {
+    pingUrl = config.kaUrl.length() ? config.kaUrl : String(CELLULAR_KEEPALIVE_DEFAULT_URL);
+  }
   String err;
-  if (!pingHostValid(pingHost, err)) {
+  if (!keepAliveUrlValid(pingUrl, err)) {
     server.send(200, "application/json", String("{\"success\":false,\"message\":\"") + jsonEscape(err) + "\"}");
     return;
   }
   if (smsUrcReceiving()) {
-    server.send(200, "application/json", "{\"success\":false,\"message\":\"短信接收中，请稍后重试UDP流量发送\"}");
+    server.send(200, "application/json", "{\"success\":false,\"message\":\"短信接收中，请稍后重试HTTP下载\"}");
     return;
   }
 
   pingJob.running = true;
   pingJob.done = false;
   pingJob.success = false;
-  pingJob.host = pingHost;
-  pingJob.message = "后台UDP流量发送中";
+  pingJob.url = pingUrl;
+  pingJob.message = "后台HTTP payload 下载中";
   pingJob.startedMs = millis();
-  logCaptureLn(String("网页端发起后台UDP流量请求: ") + pingHost);
-  server.send(200, "application/json", "{\"success\":true,\"running\":true,\"message\":\"已开始后台UDP流量发送，可继续刷新网页\"}");
+  logCaptureLn(String("网页端发起后台HTTP payload 请求: ") + pingUrl);
+  server.send(200, "application/json", "{\"success\":true,\"running\":true,\"message\":\"已开始后台HTTP payload下载，可继续刷新网页\"}");
 }
 
 // 处理保存配置请求
@@ -627,7 +640,7 @@ void handleSave() {
 
   // 保号定时任务表单（kaLastTime 由调度器/重置按钮管理，不在此处更新）
   if (server.hasArg("kaIntervalDays") || server.hasArg("kaAction") ||
-      server.hasArg("kaTarget") || server.hasArg("kaForm")) {
+      server.hasArg("kaTarget") || server.hasArg("kaUrl") || server.hasArg("kaForm")) {
     config.kaEnabled = (server.arg("kaEnabled") == "on");
     if (server.hasArg("kaIntervalDays")) {
       int d = server.arg("kaIntervalDays").toInt();
@@ -635,6 +648,14 @@ void handleSave() {
     }
     if (server.hasArg("kaAction")) config.kaAction = (uint8_t)server.arg("kaAction").toInt();
     config.kaTarget = server.arg("kaTarget");
+    if (server.hasArg("kaUrl")) {
+      String newKaUrl = server.arg("kaUrl");
+      newKaUrl.trim();
+      if (newKaUrl.length() == 0) newKaUrl = CELLULAR_KEEPALIVE_DEFAULT_URL;
+      String err;
+      if (keepAliveUrlValid(newKaUrl, err)) config.kaUrl = newKaUrl;
+      else logCaptureLn(String("保号URL未保存: ") + err);
+    }
   }
 
   // 时间 / NTP 表单
@@ -1059,7 +1080,7 @@ void handleExport() {
   LI("rebootEnabled", config.rebootEnabled ? 1 : 0); LI("rebootHour", config.rebootHour);
   LI("hbEnabled", config.hbEnabled ? 1 : 0); LI("hbHour", config.hbHour);
   LI("kaEnabled", config.kaEnabled ? 1 : 0); LI("kaIntervalDays", config.kaIntervalDays);
-  LI("kaAction", config.kaAction); L("kaTarget", config.kaTarget);
+  LI("kaAction", config.kaAction); L("kaTarget", config.kaTarget); L("kaUrl", config.kaUrl);
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     String p = "push" + String(i);
     LI((p + "en").c_str(), config.pushChannels[i].enabled ? 1 : 0);
@@ -1096,6 +1117,7 @@ static void applyConfigKey(const String& k, const String& v) {
   else if (k == "kaIntervalDays") config.kaIntervalDays = v.toInt();
   else if (k == "kaAction") config.kaAction = (uint8_t)v.toInt();
   else if (k == "kaTarget") config.kaTarget = v;
+  else if (k == "kaUrl") config.kaUrl = v.length() ? v : CELLULAR_KEEPALIVE_DEFAULT_URL;
   else if (k.startsWith("push") && k.length() > 5) {
     int idx = k.charAt(4) - '0';  // ponytail: 单位数索引，依赖 MAX_PUSH_CHANNELS<10(=5)；超过需改多位解析
     if (idx >= 0 && idx < MAX_PUSH_CHANNELS) {

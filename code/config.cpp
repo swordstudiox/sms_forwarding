@@ -24,6 +24,7 @@ void saveConfig() {
   preferences.putInt("kaDays", config.kaIntervalDays);
   preferences.putUChar("kaAct", config.kaAction);
   preferences.putString("kaTarget", config.kaTarget);
+  preferences.putString("kaUrl", config.kaUrl);
   preferences.putUInt("kaLast", config.kaLastTime);
   preferences.putInt("tzMin", config.tzOffsetMin);
   preferences.putString("ntpSrv", config.ntpServer);
@@ -76,6 +77,9 @@ void loadConfig() {
   config.kaIntervalDays = preferences.getInt("kaDays", 175);
   config.kaAction = preferences.getUChar("kaAct", KA_ACTION_PING);
   config.kaTarget = preferences.getString("kaTarget", "");
+  config.kaUrl = preferences.getString("kaUrl", CELLULAR_KEEPALIVE_DEFAULT_URL);
+  config.kaUrl.trim();
+  if (config.kaUrl.length() == 0) config.kaUrl = CELLULAR_KEEPALIVE_DEFAULT_URL;
   config.kaLastTime = preferences.getUInt("kaLast", 0);
   config.tzOffsetMin = preferences.getInt("tzMin", 480);
   config.ntpServer = preferences.getString("ntpSrv", "ntp.aliyun.com");

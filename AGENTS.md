@@ -84,7 +84,9 @@ Key flows:
   `/flight`,`/at`,`/log`(streamed, `?since=` cursor),`/modem`,`/wifi`,`/status`(health JSON),
   `/keepalive`,`/testpush`,`/ussd`. Sidebar icons are inline SVG (no emoji).
 - **Scheduler** (`scheduler.cpp`): E0 SIM keep-alive — absolute-date (NVS `kaLastTime`), power-loss
-  safe; action = ping/SMS/USSD; `keepAliveTick()` in loop, `/keepalive?action=status|run|reset`.
+  safe; action = cellular HTTP payload/SMS/USSD; `keepAliveTick()` in loop,
+  `/keepalive?action=status|run|reset`. The payload URL is persisted in `config.kaUrl` and is also
+  used by the diagnostics `/ping` route; the modem performs the HTTP GET over PDP via `AT+MHTTP*`.
 - **Config** (`config.cpp`): persisted to NVS via `Preferences`, namespace `sms_config`.
   `loadConfig()` migrates legacy single-channel keys (`httpUrl`, `barkMode`) into `pushChannels[0]`.
   New keys are additive with defaults (zero-migration). Tunable defaults (timeouts, queue size,
