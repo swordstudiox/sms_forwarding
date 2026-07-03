@@ -582,21 +582,18 @@
     function renderLogView(emptyText) {
       var el = document.getElementById('logView');
       if (!el) return;
-      var fEl = document.getElementById('logFilter');
-      var q = (fEl && fEl.value || '').trim().toLowerCase();
-      var lines = q ? logLines.filter(function(l){ return l.toLowerCase().indexOf(q) >= 0; }) : logLines;
       var stick = logNearBottom(el);  // 用户上翻查看历史时，自动刷新不把滚动条拖回底部
-      if (!lines.length) {
-        el.textContent = q ? '(无匹配日志)' : (emptyText == null ? '(暂无日志)' : emptyText);
+      if (!logLines.length) {
+        el.textContent = emptyText == null ? '(暂无日志)' : emptyText;
       } else {
         // 先转义再拼接高亮 span，无注入风险
-        el.innerHTML = lines.map(function(l) {
+        el.innerHTML = logLines.map(function(l) {
           var cls = /失败|错误|超时|异常|error|fail/i.test(l) ? ' err'
                   : (/重试|警告|warn|降级|忽略/i.test(l) ? ' warn' : '');
           return '<span class="log-line' + cls + '">' + htmlEsc(l) + '</span>';
         }).join('\n');
       }
-      if (stick) el.scrollTop = el.scrollHeight;  // 只有原本就在底部时才跟随，过滤/上翻期间不打扰
+      if (stick) el.scrollTop = el.scrollHeight;  // 只有原本就在底部时才跟随
     }
     function copyLogAll(btn) { copyText(logLines.join('\n'), btn); }
     function initLogPanel() {
@@ -608,7 +605,7 @@
     function clearLogUI() {
       logLines = [];
       renderLogView('');
-      setLogStatus('显示已清空，自动刷新只显示新日志');
+      setLogStatus('已清空，之后只显示新日志');
     }
     function reloadLog() {
       logLines = [];
@@ -636,7 +633,7 @@
         } else if (fullReload || el.textContent === '加载中...') {
           renderLogView('(暂无日志)');
         }
-        setLogStatus('设备端序号 ' + logSince + '，本页显示 ' + logLines.length + ' 条');
+        setLogStatus('共 ' + logLines.length + ' 条');
       }).catch(function() {
         if (fullReload || el.textContent === '加载中...') {
           renderLogView('无法获取日志');

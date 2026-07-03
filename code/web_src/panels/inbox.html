@@ -7,7 +7,7 @@
             <button type="button" class="msg-tab active" id="tabRecv" onclick="smsTab('recv')">已接收<span class="tab-cnt" id="cntRecv"></span></button>
             <button type="button" class="msg-tab" id="tabSent" onclick="smsTab('sent')">已发送<span class="tab-cnt" id="cntSent"></span></button>
           </div>
-          <input id="smsSearch" class="form-input" placeholder="搜索发件人或正文…" oninput="renderMessages()" style="max-width:240px;margin-left:auto;">
+          <input id="smsSearch" class="form-input msg-search" placeholder="搜索发件人或正文…" oninput="renderMessages()">
           <button class="btn btn-secondary btn-sm" onclick="loadMessages()">刷新</button>
           <button class="btn btn-primary btn-sm" onclick="openSmsModal()">发短信</button>
         </div>

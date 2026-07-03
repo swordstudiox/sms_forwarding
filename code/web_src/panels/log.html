@@ -6,7 +6,6 @@
         <div class="card-body">
           <div id="logView">加载中...</div>
           <div class="log-toolbar">
-            <input id="logFilter" class="form-input" placeholder="过滤关键词…" oninput="renderLogView()" style="max-width:170px;">
             <button class="btn btn-secondary btn-sm" onclick="clearLogUI()">清空显示</button>
             <button class="btn btn-secondary btn-sm" onclick="reloadLog()">重新加载</button>
             <button class="btn btn-secondary btn-sm" onclick="copyLogAll(this)">复制全部</button>
@@ -14,7 +13,7 @@
             <label class="log-auto"><input type="checkbox" id="logAuto" checked onchange="toggleLogAuto()"> 自动刷新</label>
           </div>
           <div class="log-status" id="logStatus"></div>
-          <p class="form-hint">每2秒自动刷新，错误行红色、重试/警告行琥珀色高亮；向上翻阅时自动刷新不会拖动滚动条。设备端保留最近 120 条，本页最多显示 500 条，“下载日志”导出当前保留内容。</p>
+          <p class="form-hint">设备在内存中保留最近 120 条日志（重启清空），本页打开期间会持续累积新日志。</p>
         </div>
       </div>
     </div>
