@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import io
 import re
 import sys
 from dataclasses import dataclass
@@ -70,7 +71,11 @@ def minify_js(text: str) -> str:
 
 
 def gzip_bytes(data: bytes) -> bytes:
-    return gzip.compress(data, compresslevel=9, mtime=0)
+    buf = io.BytesIO()
+    # gzip.compress(..., mtime=0) 在部分 Python 版本会写入平台相关 OS 字节。
+    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9, mtime=0) as gz:
+        gz.write(data)
+    return buf.getvalue()
 
 
 def asset_hash(source_texts: list[str]) -> str:
