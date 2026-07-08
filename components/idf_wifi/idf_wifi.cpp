@@ -523,31 +523,48 @@ static void mdns_sms_task(void*)
     uint8_t ttl = 255;  // RFC 6762 要求组播 TTL=255
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
-    auto join_group = [sock]() {
-        ip_mreq mreq = {};
-        mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
-        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-        return setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) == 0;
+    // 组播成员关系是"按网卡"的：任务启动早于任何网卡拿到 IP，若只在启动时用 INADDR_ANY
+    // 加一次组，STA 连上后不会自动迁移到 STA 网卡——sms.local 就只在 AP 网卡有效，连上
+    // 家里 WiFi 后静默失效。这里跟随"当前生效网卡"的 IP：变化时先退旧组、再在新网卡加组。
+    auto current_if_addr = []() -> uint32_t {
+        esp_netif_ip_info_t ip = {};
+        if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+            return ip.ip.addr;  // 网络字节序
+        }
+        if (ap_state_snapshot().mode) return inet_addr("192.168.1.1");
+        return 0;
     };
-    // 任务启动早于任何网卡拿到 IP，首次加组可能失败——失败则周期重试，
-    // 否则收不到 224.0.0.251 的查询，sms.local 整个运行期都静默失效
-    bool joined = join_group();
-    if (joined) idf_log_line("mDNS 已启动: http://sms.local");
-    else idf_log_line("mDNS 加入组播组失败，稍后自动重试");
+    uint32_t joined_if = 0;
+    auto rejoin_if_changed = [&]() {
+        uint32_t cur = current_if_addr();
+        if (cur == joined_if) return;
+        if (joined_if != 0) {
+            ip_mreq d = {};
+            d.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+            d.imr_interface.s_addr = joined_if;
+            setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP, &d, sizeof(d));
+            joined_if = 0;
+        }
+        if (cur != 0) {
+            ip_mreq a = {};
+            a.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+            a.imr_interface.s_addr = cur;
+            if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &a, sizeof(a)) == 0) {
+                joined_if = cur;
+                idf_log_line("mDNS 已在当前网卡加入组播: http://sms.local");
+            }
+        }
+    };
+    rejoin_if_changed();
 
     uint8_t req[512];
-    int retry_countdown = 0;
     while (true) {
         sockaddr_in from = {};
         socklen_t from_len = sizeof(from);
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
         // 同配网 DNS：立即报错时让出 CPU，防止 lwIP 内存紧张期高优先级忙等
         if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
-        if (!joined && ++retry_countdown >= 15) {  // recv 超时 1s，约每 15s 重试加组
-            retry_countdown = 0;
-            joined = join_group();
-            if (joined) idf_log_line("mDNS 已启动: http://sms.local");
-        }
+        rejoin_if_changed();  // recv 超时约 1s 一轮，网卡一变(STA 拿到 IP)就迁移组播成员
         if (len < 12) continue;
         uint16_t qd = (static_cast<uint16_t>(req[4]) << 8) | req[5];
         int pos = 12;
