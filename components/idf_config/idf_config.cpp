@@ -148,10 +148,10 @@ static void limit_utf8_bytes(std::string& value, size_t max_len)
 
 static void normalize_config(IdfConfig& c)
 {
-    limit_utf8_bytes(c.wifiSsid, 64);
-    limit_utf8_bytes(c.wifiPass, 128);
-    limit_utf8_bytes(c.wifiSsid2, 64);
-    limit_utf8_bytes(c.wifiPass2, 128);
+    limit_utf8_bytes(c.wifiSsid, 31);
+    limit_utf8_bytes(c.wifiPass, 63);
+    limit_utf8_bytes(c.wifiSsid2, 31);
+    limit_utf8_bytes(c.wifiPass2, 63);
     limit_utf8_bytes(c.smtpServer, 128);
     c.smtpPort = (c.smtpPort > 0 && c.smtpPort <= 65535) ? c.smtpPort : 465;
     limit_utf8_bytes(c.smtpUser, 128);
@@ -327,6 +327,16 @@ static void append_kv_u32(std::string& out, const char* key, uint32_t value)
     append_kv(out, key, buf);
 }
 
+static const char* redact_secret(const std::string& value)
+{
+    return value.empty() ? "" : "__REDACTED__";
+}
+
+static bool is_redacted_secret(const std::string& value)
+{
+    return value == "__REDACTED__";
+}
+
 esp_err_t idf_config_load(void)
 {
     esp_err_t mutex_err = ensure_config_mutex();
@@ -456,24 +466,24 @@ esp_err_t idf_config_load(void)
     return ESP_OK;
 }
 
-std::string idf_config_export_text(void)
+std::string idf_config_export_text(bool full_export)
 {
     IdfConfig c = idf_config_get();
     std::string out;
     out.reserve(4096);
 
     append_kv(out, "wifiSsid", c.wifiSsid);
-    append_kv(out, "wifiPass", c.wifiPass);
+    append_kv(out, "wifiPass", full_export ? c.wifiPass : redact_secret(c.wifiPass));
     append_kv(out, "wifiSsid2", c.wifiSsid2);
-    append_kv(out, "wifiPass2", c.wifiPass2);
+    append_kv(out, "wifiPass2", full_export ? c.wifiPass2 : redact_secret(c.wifiPass2));
     append_kv(out, "smtpServer", c.smtpServer);
     append_kv_i(out, "smtpPort", c.smtpPort);
     append_kv(out, "smtpUser", c.smtpUser);
-    append_kv(out, "smtpPass", c.smtpPass);
+    append_kv(out, "smtpPass", full_export ? c.smtpPass : redact_secret(c.smtpPass));
     append_kv(out, "smtpSendTo", c.smtpSendTo);
     append_kv(out, "adminPhone", c.adminPhone);
     append_kv(out, "webUser", c.webUser);
-    append_kv(out, "webPass", c.webPass);
+    append_kv(out, "webPass", full_export ? c.webPass : redact_secret(c.webPass));
     append_kv(out, "numBlkList", c.numberBlackList);
     append_kv(out, "fwdRules", c.forwardRules);
     append_kv_i(out, "emailEnabled", c.emailEnabled ? 1 : 0);
@@ -512,9 +522,9 @@ std::string idf_config_export_text(void)
         snprintf(key, sizeof(key), "push%dname", i);
         append_kv(out, key, ch.name);
         snprintf(key, sizeof(key), "push%dk1", i);
-        append_kv(out, key, ch.key1);
+        append_kv(out, key, full_export ? ch.key1 : redact_secret(ch.key1));
         snprintf(key, sizeof(key), "push%dk2", i);
-        append_kv(out, key, ch.key2);
+        append_kv(out, key, full_export ? ch.key2 : redact_secret(ch.key2));
         snprintf(key, sizeof(key), "push%dbody", i);
         append_kv(out, key, ch.customBody);
     }
@@ -547,17 +557,17 @@ std::string idf_config_export_text(void)
 static void apply_import_key(IdfConfig& c, const std::string& key, const std::string& value)
 {
     if (key == "wifiSsid") c.wifiSsid = value;
-    else if (key == "wifiPass") c.wifiPass = value;
+    else if (key == "wifiPass" && !is_redacted_secret(value)) c.wifiPass = value;
     else if (key == "wifiSsid2") c.wifiSsid2 = value;
-    else if (key == "wifiPass2") c.wifiPass2 = value;
+    else if (key == "wifiPass2" && !is_redacted_secret(value)) c.wifiPass2 = value;
     else if (key == "smtpServer") c.smtpServer = value;
     else if (key == "smtpPort") import_int_field(c.smtpPort, value);
     else if (key == "smtpUser") c.smtpUser = value;
-    else if (key == "smtpPass") c.smtpPass = value;
+    else if (key == "smtpPass" && !is_redacted_secret(value)) c.smtpPass = value;
     else if (key == "smtpSendTo") c.smtpSendTo = value;
     else if (key == "adminPhone") c.adminPhone = value;
     else if (key == "webUser" && !is_blank(value)) c.webUser = value;
-    else if (key == "webPass" && !is_blank(value)) c.webPass = value;
+    else if (key == "webPass" && !is_blank(value) && !is_redacted_secret(value)) c.webPass = value;
     else if (key == "numBlkList" || key == "numberBlackList") c.numberBlackList = value;
     else if (key == "fwdRules" || key == "forwardRules") c.forwardRules = value;
     else if (key == "emailEnabled") c.emailEnabled = bool_from_text(value);
@@ -611,8 +621,8 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
         else if (suffix == "type") import_u8_field(ch.type, value);
         else if (suffix == "url") ch.url = value;
         else if (suffix == "name") ch.name = value.empty() ? channel_default_name(idx) : value;
-        else if (suffix == "k1") ch.key1 = value;
-        else if (suffix == "k2") ch.key2 = value;
+        else if (suffix == "k1" && !is_redacted_secret(value)) ch.key1 = value;
+        else if (suffix == "k2" && !is_redacted_secret(value)) ch.key2 = value;
         else if (suffix == "body") ch.customBody = value;
     }
 }
@@ -917,20 +927,42 @@ esp_err_t idf_config_save(void)
 }
 
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
-                               const std::string& ssid2, const std::string& pass2)
+                               const std::string& ssid2, const std::string& pass2,
+                               bool preserve_blank_pass, bool preserve_blank_pass2,
+                               bool clear_pass, bool clear_pass2)
 {
-    if ((ssid.empty() && ssid2.empty()) || ssid.size() > 32 || ssid2.size() > 32 ||
-        pass.size() > 64 || pass2.size() > 64) {
+    esp_err_t mutex_err = ensure_config_mutex();
+    if (mutex_err != ESP_OK) return mutex_err;
+
+    if ((ssid.empty() && ssid2.empty()) || ssid.size() >= 32 || ssid2.size() >= 32 ||
+        pass.size() >= 64 || pass2.size() >= 64) {
         return ESP_ERR_INVALID_ARG;
     }
     std::string next_ssid = ssid;
     std::string next_pass = pass;
     std::string next_ssid2 = ssid2;
     std::string next_pass2 = pass2;
-    limit_utf8_bytes(next_ssid, 64);
-    limit_utf8_bytes(next_pass, 128);
-    limit_utf8_bytes(next_ssid2, 64);
-    limit_utf8_bytes(next_pass2, 128);
+
+    if (clear_pass) {
+        next_pass.clear();
+    } else if (preserve_blank_pass && is_blank(next_pass)) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        next_pass = s_config.wifiPass;
+        xSemaphoreGive(s_config_mutex);
+    }
+    if (clear_pass2) {
+        next_pass2.clear();
+    } else if (preserve_blank_pass2 && is_blank(next_pass2)) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        next_pass2 = s_config.wifiPass2;
+        xSemaphoreGive(s_config_mutex);
+    }
+    if (next_pass.size() >= 64 || next_pass2.size() >= 64) return ESP_ERR_INVALID_ARG;
+
+    limit_utf8_bytes(next_ssid, 31);
+    limit_utf8_bytes(next_pass, 63);
+    limit_utf8_bytes(next_ssid2, 31);
+    limit_utf8_bytes(next_pass2, 63);
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);

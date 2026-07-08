@@ -33,6 +33,7 @@
 #include "idf_sms.h"
 #include "idf_wifi.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/sha256.h"
 #include "web_assets.h"
 
 static const char* TAG = "idf_web";
@@ -70,6 +71,7 @@ static bool cell_job_lock(TickType_t ticks = pdMS_TO_TICKS(300));
 static void cell_job_unlock(void);
 static bool cellular_job_active_locked(void);
 static bool cellular_job_active(void);
+static void set_json_no_cache(httpd_req_t* req);
 
 static void cleanup_cell_job_mutex_if_unused()
 {
@@ -203,6 +205,19 @@ static bool check_auth(httpd_req_t* req)
     return false;
 }
 
+static bool check_csrf(httpd_req_t* req)
+{
+    char token[16] = {};
+    if (httpd_req_get_hdr_value_str(req, "X-SMS-CSRF", token, sizeof(token)) == ESP_OK &&
+        strcmp(token, "1") == 0) {
+        return true;
+    }
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"跨站写入校验失败，请刷新页面后重试\"}");
+    return false;
+}
+
 static bool etag_matches(httpd_req_t* req, const WebAsset& asset)
 {
     char inm[96] = {};
@@ -231,7 +246,8 @@ static void set_json_no_cache(httpd_req_t* req)
 
 static bool ensure_get_or_post(httpd_req_t* req)
 {
-    if (req->method == HTTP_GET || req->method == HTTP_POST) return true;
+    if (req->method == HTTP_GET) return true;
+    if (req->method == HTTP_POST) return check_csrf(req);
     set_json_no_cache(req);
     httpd_resp_set_status(req, "405 Method Not Allowed");
     httpd_resp_set_hdr(req, "Allow", "GET, POST");
@@ -1208,6 +1224,7 @@ static void parse_sched_tasks_form(const IdfFormFields& fields,
 static esp_err_t handle_save(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     std::string body;
     // 16KB：5 个自定义推送模板 + 转发规则 URL 编码后可能超过 8KB
     if (read_body(req, body, 16384) != ESP_OK) return ESP_OK;
@@ -1382,7 +1399,9 @@ static esp_err_t handle_save(httpd_req_t* req)
 static esp_err_t handle_export_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
-    std::string body = idf_config_export_text();
+    std::string full;
+    get_query_param(req, "full", full, 64);
+    std::string body = (full == "1") ? idf_config_export_text(true) : idf_config_export_text(false);
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
     set_no_cache_headers(req);
     httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=sms_config.txt");
@@ -1392,6 +1411,7 @@ static esp_err_t handle_export_config(httpd_req_t* req)
 static esp_err_t handle_import_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     std::string body;
     if (read_body(req, body, 16384) != ESP_OK) return ESP_OK;
     int applied = 0;
@@ -1431,6 +1451,7 @@ static void schedule_restart_or_now(const char* task_name)
 static esp_err_t handle_factory_reset(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     esp_err_t err = idf_config_factory_reset();
     if (err == ESP_OK) idf_log_line("网页触发恢复出厂：已清除全部配置，即将重启");
     set_json_no_cache(req);
@@ -1448,6 +1469,7 @@ static esp_err_t handle_factory_reset(httpd_req_t* req)
 static esp_err_t handle_wifi_config(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     std::string body;
     if (read_body(req, body, 1024) != ESP_OK) return ESP_OK;
     IdfFormFields fields = parse_urlencoded(body);
@@ -1455,10 +1477,13 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     const std::string* pass = find_field(fields, "pass");
     const std::string* ssid2 = find_field(fields, "ssid2");
     const std::string* pass2 = find_field(fields, "pass2");
+    bool clear_pass = has_field(fields, "clearPass");
+    bool clear_pass2 = has_field(fields, "clearPass2");
     esp_err_t err = idf_config_save_wifi(ssid ? *ssid : std::string(),
                                          pass ? *pass : std::string(),
                                          ssid2 ? *ssid2 : std::string(),
-                                         pass2 ? *pass2 : std::string());
+                                         pass2 ? *pass2 : std::string(),
+                                         true, true, clear_pass, clear_pass2);
     set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
@@ -1529,9 +1554,41 @@ static bool parse_multipart_boundary(const char* content_type, std::string& mark
     return true;
 }
 
+static bool is_hex_sha256(const std::string& value)
+{
+    if (value.size() != 64) return false;
+    for (char ch : value) {
+        if (!isxdigit(static_cast<unsigned char>(ch))) return false;
+    }
+    return true;
+}
+
+static std::string hex_lower(const unsigned char* data, size_t len)
+{
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out.push_back(kHex[(data[i] >> 4) & 0x0F]);
+        out.push_back(kHex[data[i] & 0x0F]);
+    }
+    return out;
+}
+
 static esp_err_t handle_ota_update(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
+
+    std::string expected_sha256;
+    get_query_param(req, "sha256", expected_sha256, 128);
+    if (!expected_sha256.empty() && !is_hex_sha256(expected_sha256)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid SHA-256");
+        return ESP_OK;
+    }
+    for (char& ch : expected_sha256) {
+        ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    }
 
     char ctype[160] = {};
     std::string boundary_marker;
@@ -1567,10 +1624,17 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     pending.reserve(boundary_marker.size() + 1024);
     bool in_file = false;
     bool saw_boundary = false;
+    bool sha_mismatch = false;
     size_t received = 0;
     size_t written = 0;
     char buf[1024];
     const size_t keep_tail = boundary_marker.size() + 8;
+    mbedtls_sha256_context sha_ctx;
+    bool sha_active = !expected_sha256.empty();
+    if (sha_active) {
+        mbedtls_sha256_init(&sha_ctx);
+        mbedtls_sha256_starts(&sha_ctx, 0);
+    }
 
     int timeouts = 0;
     // 涓流上传防护：连续超时计数外再加总时长硬上限。局域网正常 OTA 只要几十秒，
@@ -1611,6 +1675,11 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
             }
             err = esp_ota_write(ota, pending.data(), writable);
             if (err == ESP_OK) {
+                if (sha_active) {
+                    mbedtls_sha256_update(&sha_ctx,
+                                          reinterpret_cast<const unsigned char*>(pending.data()),
+                                          writable);
+                }
                 written += writable;
                 pending.erase(0, writable);
             }
@@ -1628,13 +1697,30 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
                 } else {
                     err = esp_ota_write(ota, pending.data(), boundary);
                 }
-                if (err == ESP_OK) written += boundary;
+                if (err == ESP_OK) {
+                    if (sha_active) {
+                        mbedtls_sha256_update(&sha_ctx,
+                                              reinterpret_cast<const unsigned char*>(pending.data()),
+                                              boundary);
+                    }
+                    written += boundary;
+                }
             }
             saw_boundary = true;
         }
     }
 
     if (err == ESP_OK && (!in_file || !saw_boundary || written == 0)) err = ESP_ERR_INVALID_SIZE;
+    if (err == ESP_OK && sha_active) {
+        unsigned char digest[32] = {};
+        mbedtls_sha256_finish(&sha_ctx, digest);
+        std::string actual = hex_lower(digest, sizeof(digest));
+        if (actual != expected_sha256) {
+            sha_mismatch = true;
+            err = ESP_ERR_INVALID_CRC;
+        }
+    }
+    if (sha_active) mbedtls_sha256_free(&sha_ctx);
     if (err == ESP_OK) err = esp_ota_end(ota);
     else esp_ota_abort(ota);
     if (err == ESP_OK) err = esp_ota_set_boot_partition(part);
@@ -1642,9 +1728,11 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
     set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string body = "{\"success\":false,";
-        json_prop(body, "message", std::string("升级失败: ") + esp_err_to_name(err));
+        json_prop(body, "message", sha_mismatch ? "OTA SHA-256 校验失败，已拒绝启用该固件"
+                                                : std::string("升级失败: ") + esp_err_to_name(err));
         body += "}";
-        idf_logf("OTA 失败: %s", esp_err_to_name(err));
+        if (sha_mismatch) idf_log_line("OTA SHA-256 校验失败，已拒绝启用该固件");
+        else idf_logf("OTA 失败: %s", esp_err_to_name(err));
         return httpd_resp_send(req, body.c_str(), body.size());
     }
 
@@ -1657,6 +1745,7 @@ static esp_err_t handle_ota_update(httpd_req_t* req)
 static esp_err_t handle_send_sms(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     std::string raw;
     if (read_body(req, raw, 2048) != ESP_OK) return ESP_OK;
     IdfFormFields fields = parse_urlencoded(raw);
@@ -1789,6 +1878,7 @@ static esp_err_t handle_coredump_download(httpd_req_t* req)
 static esp_err_t handle_coredump_clear(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     set_json_no_cache(req);
     esp_err_t err = esp_core_dump_image_erase();
     if (err == ESP_OK) {
@@ -1834,6 +1924,7 @@ static bool query_u8_range(httpd_req_t* req, const char* key, uint8_t max_exclus
 static esp_err_t handle_delete_message(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     uint32_t id = 0;
     bool ok = query_u32(req, "id", id) && idf_inbox_delete(id);
     set_json_no_cache(req);
@@ -1845,6 +1936,7 @@ static esp_err_t handle_delete_message(httpd_req_t* req)
 static esp_err_t handle_resend_message(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     uint32_t id = 0;
     IdfInboxEntry entry;
     bool found = query_u32(req, "id", id) && idf_inbox_get_by_id(id, entry);
@@ -3302,6 +3394,7 @@ static esp_err_t handle_schedtask(httpd_req_t* req)
 static esp_err_t handle_netled(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     set_json_no_cache(req);
     if (req->method != HTTP_POST) {
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"该操作需要 POST\"}");
@@ -3331,6 +3424,7 @@ static esp_err_t handle_netled(httpd_req_t* req)
 static esp_err_t handle_ntp(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     set_json_no_cache(req);
     esp_err_t err = idf_wifi_resync_ntp();
     uint32_t now = static_cast<uint32_t>(time(nullptr));
@@ -3352,6 +3446,7 @@ static esp_err_t handle_ntp(httpd_req_t* req)
 static esp_err_t handle_reboot(httpd_req_t* req)
 {
     if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
     idf_log_line("网页触发设备重启");
     set_json_no_cache(req);
     esp_err_t send_err = httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"设备即将重启\"}");

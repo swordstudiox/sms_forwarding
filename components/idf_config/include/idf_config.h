@@ -90,7 +90,9 @@ using IdfFormFields = std::vector<std::pair<std::string, std::string>>;
 esp_err_t idf_config_load(void);
 esp_err_t idf_config_save(void);
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
-                               const std::string& ssid2, const std::string& pass2);
+                               const std::string& ssid2, const std::string& pass2,
+                               bool preserve_blank_pass, bool preserve_blank_pass2,
+                               bool clear_pass, bool clear_pass2);
 esp_err_t idf_config_save_account(const std::string& user, const std::string& pass);
 esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server);
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
@@ -107,7 +109,7 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
 esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS]);
 esp_err_t idf_config_save_sim(bool data_enabled, const std::string& apn,
                               const std::string& operator_plmn);
-std::string idf_config_export_text(void);
+std::string idf_config_export_text(bool full_export);
 esp_err_t idf_config_import_text(const std::string& text, int* applied_count);
 esp_err_t idf_config_factory_reset(void);
 esp_err_t idf_config_set_keepalive_last(uint32_t epoch);

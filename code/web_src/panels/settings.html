@@ -49,8 +49,8 @@
         <div class="card">
           <div class="card-header">配置备份 / 恢复</div>
           <div class="card-body">
-            <div class="btn-row"><button class="btn btn-secondary" onclick="doExport()">导出配置</button></div>
-            <p class="form-hint">导出为文本文件（含凭据，请妥善保管）。恢复：粘贴备份内容后点导入</p>
+            <div class="btn-row"><button class="btn btn-secondary" onclick="doExport()">导出配置（脱敏）</button><button class="btn btn-secondary" onclick="doExportFull()">完整导出</button></div>
+            <p class="form-hint">默认导出会隐藏 WiFi、账号、SMTP 和推送密钥；完整导出含凭据，请妥善保管。恢复：粘贴备份内容后点导入</p>
             <textarea class="form-textarea" id="importBox" rows="4" placeholder="粘贴备份内容到此处..."></textarea>
             <div class="btn-row" style="margin-top:8px;"><button class="btn btn-primary btn-sm" onclick="doImport()">导入配置</button></div>
             <div class="result-box" id="importResult"></div>
@@ -60,8 +60,9 @@
           <div class="card-header">固件升级 (OTA)</div>
           <div class="card-body">
             <input class="form-input" type="file" id="otaFile" accept=".bin">
+            <input class="form-input" type="text" id="otaSha256" placeholder="可选：固件 SHA-256（64 位十六进制）" style="margin-top:8px;">
             <div class="btn-row" style="margin-top:8px;"><button class="btn btn-primary btn-sm" onclick="doOta()">上传并升级</button></div>
-            <p class="form-hint">上传编译生成的 .bin 固件；升级中请勿断电，约需 30-60 秒</p>
+            <p class="form-hint">上传编译生成的 .bin 固件；填写 SHA-256 时设备会校验固件内容，不匹配则拒绝启用；升级中请勿断电，约需 30-60 秒</p>
             <div class="result-box" id="otaResult"></div>
           </div>
         </div>
