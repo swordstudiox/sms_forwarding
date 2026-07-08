@@ -27,3 +27,6 @@ esp_err_t idf_wifi_reconnect(void);
 esp_err_t idf_wifi_resync_ntp(void);
 esp_err_t idf_wifi_scan_json(std::string& out_json);
 IdfWifiStatus idf_wifi_get_status(void);
+// 是否处于配网热点(AP/APSTA)模式的轻量查询——只读内部状态快照，不触发
+// esp_wifi/MAC/IP 读取，供每个请求都要判断的 Web 鉴权快速路径使用。
+bool idf_wifi_is_ap_mode(void);

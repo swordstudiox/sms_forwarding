@@ -188,8 +188,34 @@ static bool auth_matches_config(const char* auth)
     return idf_config_check_web_auth(reinterpret_cast<char*>(decoded), colon + 1);
 }
 
+// 配网热点模式下允许免认证访问的接口白名单：加载配网页面(SPA 与静态资源)、
+// 读取状态/配置(密码字段已脱敏)、扫描与提交 WiFi。仅覆盖"进入配网页并配好 WiFi"
+// 所需的最小集合。
+static bool is_ap_open_uri(const char* uri)
+{
+    if (!uri) return false;
+    // 静态资源按前缀放行(/assets/app.js、/assets/app.css 等)
+    if (strncmp(uri, "/assets/", 8) == 0) return true;
+    // 其余按"路径"精确匹配，忽略 ?query
+    size_t path_len = strcspn(uri, "?");
+    static const char* const kOpen[] = {
+        "/", "/ui", "/status", "/config.json", "/wifiscan", "/wificonfig",
+    };
+    for (const char* p : kOpen) {
+        if (strlen(p) == path_len && strncmp(uri, p, path_len) == 0) return true;
+    }
+    return false;
+}
+
 static bool check_auth(httpd_req_t* req)
 {
+    // 配网热点(开放 AP)模式下放行配网所需接口：设备此时是开放无加密热点，系统
+    // Captive Portal 探测/弹窗只能拿到 401(显示 "unauthorized")，新用户无从进入
+    // 配网页面(见 issue #1)；且开放空口上 Basic 凭据本就明文可嗅探，对这几个
+    // 只读/配网接口强制认证意义不大。导出/导入/OTA/发短信/收件箱等敏感接口不在
+    // 白名单内，仍需认证，避免开放热点期间泄露密钥或被滥用。
+    if (idf_wifi_is_ap_mode() && is_ap_open_uri(req->uri)) return true;
+
     char auth[512] = {};
     if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK &&
         auth_matches_config(auth)) {

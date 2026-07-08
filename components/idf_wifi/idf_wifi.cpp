@@ -925,6 +925,11 @@ esp_err_t idf_wifi_scan_json(std::string& out_json)
     return ESP_OK;
 }
 
+bool idf_wifi_is_ap_mode(void)
+{
+    return ap_state_snapshot().mode;
+}
+
 IdfWifiStatus idf_wifi_get_status(void)
 {
     IdfWifiStatus s;
