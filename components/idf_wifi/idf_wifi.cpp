@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <new>
 #include <vector>
 
 #include "driver/gpio.h"
@@ -62,6 +63,13 @@ static char s_ntp_server[128] = "ntp.aliyun.com";
 static esp_err_t start_provisioning_ap(bool manual = false);
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data);
 
+struct StaCredential {
+    std::string ssid;
+    std::string pass;
+    int index = 1;
+    bool fallback = false;
+};
+
 struct ApState {
     bool mode = false;
     bool manual = false;
@@ -94,6 +102,18 @@ static bool sta_can_connect()
 {
     return s_has_sta_credentials.load(std::memory_order_relaxed) &&
            s_sta_configured.load(std::memory_order_relaxed);
+}
+
+static std::vector<StaCredential> build_sta_candidates(const IdfConfig& config)
+{
+    std::vector<StaCredential> candidates;
+    if (!config.wifiSsid.empty()) {
+        candidates.push_back({config.wifiSsid, config.wifiPass, 1, config.wifiFromFallback});
+    }
+    if (!config.wifiSsid2.empty() && config.wifiSsid2 != config.wifiSsid) {
+        candidates.push_back({config.wifiSsid2, config.wifiPass2, 2, false});
+    }
+    return candidates;
 }
 
 static std::string format_epoch_local(time_t epoch, int tz_offset_min)
@@ -660,46 +680,77 @@ static void provision_button_task(void*)
 }
 
 // 只发起 STA 连接不等待结果；首连成败由 sta_connect_watch_task 后台判定。
-// 这样 app_main 不再被首连(最长 20s)阻塞，Web/推送/模组/短信与 WiFi 连接并行启动。
-static esp_err_t connect_sta_begin(const IdfConfig& config)
+// 这样 app_main 不再被首连阻塞，Web/推送/模组/短信与 WiFi 连接并行启动。
+static esp_err_t connect_sta_begin(const StaCredential& cred, bool disconnect_first)
 {
+    s_sta_configured.store(false, std::memory_order_relaxed);
+    if (disconnect_first) {
+        esp_err_t disc_err = esp_wifi_disconnect();
+        if (disc_err != ESP_OK) {
+            ESP_LOGW(TAG, "切换 WiFi 前断开 STA 失败: %s", esp_err_to_name(disc_err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
     wifi_config_t sta_config = {};
-    strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), config.wifiSsid.c_str(), sizeof(sta_config.sta.ssid));
-    strlcpy(reinterpret_cast<char*>(sta_config.sta.password), config.wifiPass.c_str(), sizeof(sta_config.sta.password));
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), cred.ssid.c_str(), sizeof(sta_config.sta.ssid));
+    strlcpy(reinterpret_cast<char*>(sta_config.sta.password), cred.pass.c_str(), sizeof(sta_config.sta.password));
     sta_config.sta.scan_method = WIFI_FAST_SCAN;
     sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_err_t err = esp_wifi_set_mode(ap_state_snapshot().mode ? WIFI_MODE_APSTA : WIFI_MODE_STA);
     if (err != ESP_OK) return err;
     err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     if (err != ESP_OK) return err;
     s_sta_configured.store(true, std::memory_order_relaxed);
     err = esp_wifi_connect();
     if (err != ESP_OK) return err;
-    ESP_LOGI(TAG, "连接 WiFi: %s%s", config.wifiSsid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
-    idf_logf("连接 WiFi: %s%s", config.wifiSsid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
+    ESP_LOGI(TAG, "连接 WiFi %d: %s%s", cred.index, cred.ssid.c_str(), cred.fallback ? " (fallback)" : "");
+    idf_logf("连接 WiFi %d: %s%s", cred.index, cred.ssid.c_str(), cred.fallback ? " (fallback)" : "");
     return ESP_OK;
 }
 
-// 等待首连结果：成功清 AP 态；20s 超时回退配网 AP(与原同步逻辑一致)
-static void sta_wait_first_connect(void)
+static bool sta_wait_connect_result(const StaCredential& cred)
 {
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE,
         pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
     if (bits & WIFI_CONNECTED_BIT) {
         set_ap_state(false, false, std::string());
-    } else {
-        ESP_LOGW(TAG, "WiFi 首次连接超时，进入 APSTA 配网模式");
-        idf_log_line("WiFi 首次连接超时，进入 APSTA 配网模式");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(start_provisioning_ap(false));
+        return true;
     }
+    ESP_LOGW(TAG, "WiFi %d 首次连接超时: %s", cred.index, cred.ssid.c_str());
+    idf_logf("WiFi %d 首次连接超时: %s", cred.index, cred.ssid.c_str());
+    return false;
 }
 
-static void sta_connect_watch_task(void*)
+// 等待首连结果：按配置顺序尝试 WiFi 1/2；全部失败后回退配网 AP。
+static void sta_try_candidates(std::vector<StaCredential>& candidates)
 {
-    sta_wait_first_connect();
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        esp_err_t err = connect_sta_begin(candidates[i], i > 0);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi %d 连接发起失败(%s)", candidates[i].index, esp_err_to_name(err));
+            idf_logf("WiFi %d 连接发起失败(%s)", candidates[i].index, esp_err_to_name(err));
+            continue;
+        }
+        if (sta_wait_connect_result(candidates[i])) return;
+        if (i + 1 < candidates.size()) idf_log_line("准备尝试下一组 WiFi");
+    }
+    ESP_LOGW(TAG, "全部 WiFi 首次连接失败，进入 APSTA 配网模式");
+    idf_log_line("全部 WiFi 首次连接失败，进入 APSTA 配网模式");
+    ESP_ERROR_CHECK_WITHOUT_ABORT(start_provisioning_ap(false));
+}
+
+static void sta_connect_watch_task(void* arg)
+{
+    std::vector<StaCredential>* candidates = static_cast<std::vector<StaCredential>*>(arg);
+    if (candidates) {
+        sta_try_candidates(*candidates);
+        delete candidates;
+    }
     vTaskDelete(nullptr);
 }
 
@@ -715,7 +766,8 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         cleanup_wifi_start_resources(false, false, false);
         return ESP_ERR_NO_MEM;
     }
-    s_has_sta_credentials.store(!config.wifiSsid.empty(), std::memory_order_relaxed);
+    std::vector<StaCredential> candidates = build_sta_candidates(config);
+    s_has_sta_credentials.store(!candidates.empty(), std::memory_order_relaxed);
 
     s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif = esp_netif_create_default_wifi_ap();
@@ -802,23 +854,20 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         }
     }
 
-    if (config.wifiSsid.empty()) {
+    if (candidates.empty()) {
         ESP_LOGW(TAG, "未配置 WiFi，进入配网 AP");
         idf_log_line("未配置 WiFi，进入配网 AP");
         return start_provisioning_ap(false);
     }
 
-    err = connect_sta_begin(config);
-    if (err != ESP_OK) {
-        // 连接发起即失败(set_mode/set_config/connect 错误)：记录真实错误码后直接回退配网
-        ESP_LOGW(TAG, "WiFi 连接发起失败(%s)，进入 APSTA 配网模式", esp_err_to_name(err));
-        idf_logf("WiFi 连接发起失败(%s)，进入 APSTA 配网模式", esp_err_to_name(err));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(start_provisioning_ap(false));
-        return ESP_OK;
-    }
     // 3072：任务里 start_provisioning_ap 会用到 wifi_config_t + 日志格式化缓冲
-    if (xTaskCreate(sta_connect_watch_task, "idf_sta_watch", 3072, nullptr, 2, nullptr) != pdPASS) {
-        sta_wait_first_connect();  // 任务创建失败退回同步等待，保证配网回退不丢
+    auto* task_candidates = new (std::nothrow) std::vector<StaCredential>(candidates);
+    if (!task_candidates ||
+        xTaskCreate(sta_connect_watch_task, "idf_sta_watch", 4096, task_candidates, 2, nullptr) != pdPASS) {
+        if (task_candidates) {
+            delete task_candidates;
+        }
+        sta_try_candidates(candidates);  // 任务创建失败退回同步等待，保证配网回退不丢
     }
     return ESP_OK;
 }

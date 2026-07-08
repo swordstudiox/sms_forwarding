@@ -451,6 +451,8 @@ static esp_err_t send_config_json(httpd_req_t* req)
     body.reserve(4096);
     char buf[256];
     body += "{";
+    json_prop(body, "wifiSsid", cfg.wifiSsid); body += ",";
+    json_prop(body, "wifiSsid2", cfg.wifiSsid2); body += ",";
     json_prop(body, "webUser", cfg.webUser); body += ",";
     // 密码字段只用于表单占位，不能在配置 JSON 中回显明文。
     json_prop(body, "webPass", ""); body += ",";
@@ -1451,7 +1453,12 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     IdfFormFields fields = parse_urlencoded(body);
     const std::string* ssid = find_field(fields, "ssid");
     const std::string* pass = find_field(fields, "pass");
-    esp_err_t err = idf_config_save_wifi(ssid ? *ssid : std::string(), pass ? *pass : std::string());
+    const std::string* ssid2 = find_field(fields, "ssid2");
+    const std::string* pass2 = find_field(fields, "pass2");
+    esp_err_t err = idf_config_save_wifi(ssid ? *ssid : std::string(),
+                                         pass ? *pass : std::string(),
+                                         ssid2 ? *ssid2 : std::string(),
+                                         pass2 ? *pass2 : std::string());
     set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
