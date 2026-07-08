@@ -823,10 +823,22 @@
       }).catch(function(){});
     }
     // 保号卡：启用态高亮 + kaForm 安全 arm（与自定义任务 st* 同一套保护）
+    // 切换启用高亮：首次(面板切入后异步回填)时关掉过渡，避免卡片闪一下；之后的用户操作正常过渡
+    function applyCardEnabled(card, enabled) {
+      if (!card) return;
+      if (!card.dataset.animReady) {
+        card.classList.add('no-anim');
+        card.classList.toggle('enabled', enabled);
+        void card.offsetWidth;               // 强制重排，让无过渡样式立即落地
+        card.classList.remove('no-anim');
+        card.dataset.animReady = '1';
+      } else {
+        card.classList.toggle('enabled', enabled);
+      }
+    }
     function kaSyncHead() {
-      var card = document.getElementById('kaCard');
       var en = document.getElementById('kaEnabled');
-      if (card) card.className = 'push-channel st-task ka-card' + (en && en.checked ? ' enabled' : '');
+      applyCardEnabled(document.getElementById('kaCard'), !!(en && en.checked));
     }
     function kaArmForm() {
       if (document.getElementById('kaFormFlag')) return;
@@ -990,9 +1002,8 @@
       var name = document.getElementById('st' + i + 'Name');
       var sum = document.getElementById('st' + i + 'Sum');
       if (sum) sum.textContent = name && name.value ? name.value : '';
-      var card = document.getElementById('stTask' + i);
       var en = document.getElementById('st' + i + 'En');
-      if (card) card.className = 'push-channel st-task' + (en && en.checked ? ' enabled' : '');
+      applyCardEnabled(document.getElementById('stTask' + i), !!(en && en.checked));
     }
     function stArmForm() {
       // stForm 标志只在状态成功回填后注入：加载失败/未完成时点保存
