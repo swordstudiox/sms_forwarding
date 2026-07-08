@@ -91,6 +91,14 @@ jobs:
 
             整机烧录命令（Windows 示例，按实际设备管理器里的串口号替换 `COM5`）：
 
+            常用精简版：
+
+            ```powershell
+            esptool.py --chip esp32c3 -p COM5 -b 460800 write_flash 0x0 sms_forwarder_full_v${{ steps.version.outputs.version }}.bin
+            ```
+
+            完整显式版：
+
             ```powershell
             esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v${{ steps.version.outputs.version }}.bin
             ```
