@@ -1536,12 +1536,14 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     IdfFormFields fields = parse_urlencoded(body);
     const std::string* ssid = find_field(fields, "ssid");
     const std::string* pass = find_field(fields, "pass");
+    std::string ssid_s = ssid ? *ssid : std::string();
+    std::string pass_s = pass ? *pass : std::string();
     const std::string* ssid2 = find_field(fields, "ssid2");
     const std::string* pass2 = find_field(fields, "pass2");
     bool clear_pass = has_field(fields, "clearPass");
     bool clear_pass2 = has_field(fields, "clearPass2");
-    esp_err_t err = idf_config_save_wifi(ssid ? *ssid : std::string(),
-                                         pass ? *pass : std::string(),
+    esp_err_t err = idf_config_save_wifi(ssid_s,
+                                         pass_s,
                                          ssid2 ? *ssid2 : std::string(),
                                          pass2 ? *pass2 : std::string(),
                                          true, true, clear_pass, clear_pass2);

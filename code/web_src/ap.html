@@ -64,7 +64,7 @@ var ssid=$('ssid').value.trim();
 if(!ssid){show('err','请输入 WiFi 名称');return}
 var b=$('saveBtn');b.disabled=true;b.textContent='连接中…';
 var body='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent($('pass').value);
-fetch('/wificonfig',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){return r.json()}).then(function(d){
+fetch('/wificonfig',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded','X-SMS-CSRF':'1'},body:body}).then(function(r){return r.json()}).then(function(d){
 if(!d.success){show('err',d.message||'配置无效');b.disabled=false;b.textContent='保存并连接';return}
 show('info','已保存，正在连接 <b>'+(ssid.replace(/</g,'&lt;'))+'</b> …<br>切换信道时本页可能短暂断开，会自动恢复，请稍候。');
 startPoll();
