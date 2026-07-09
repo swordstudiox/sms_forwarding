@@ -180,22 +180,35 @@ static std::string format_epoch_local(uint32_t epoch, int tz_offset_min)
     return std::string(buf);
 }
 
-static std::string strip_country_code(const std::string& num)
+static std::string canonical_phone(const std::string& num)
 {
-    return num.rfind("+86", 0) == 0 ? num.substr(3) : num;
+    size_t start = 0;
+    while (start < num.size() && isspace(static_cast<unsigned char>(num[start]))) ++start;
+    bool explicit_cn_prefix = start < num.size() && num[start] == '+';
+
+    std::string out;
+    out.reserve(num.size());
+    for (size_t i = 0; i < num.size(); ++i) {
+        unsigned char ch = static_cast<unsigned char>(num[i]);
+        if (isdigit(ch)) out += static_cast<char>(ch);
+    }
+    if (out.rfind("86", 0) == 0 && out.size() > 2 && (explicit_cn_prefix || out.size() == 13)) {
+        return out.substr(2);
+    }
+    return out;
 }
 
 static bool number_blacklisted(const std::string& list, const std::string& sender)
 {
     if (list.empty()) return false;
-    std::string s1 = sender;
-    std::string s2 = strip_country_code(sender);
+    std::string target = canonical_phone(sender);
+    if (target.empty()) return false;
     size_t pos = 0;
     while (pos <= list.size()) {
         size_t end = list.find('\n', pos);
         if (end == std::string::npos) end = list.size();
         std::string line = trim(list.substr(pos, end - pos));
-        if (!line.empty() && (line == s1 || line == s2 || strip_country_code(line) == s2)) {
+        if (!line.empty() && canonical_phone(line) == target) {
             return true;
         }
         if (end == list.size()) break;
@@ -218,7 +231,8 @@ static bool is_valid_phone_number(const std::string& phone)
 static bool is_admin_sender(const std::string& sender, const IdfSmsProcessView& cfg)
 {
     if (cfg.adminPhone.empty()) return false;
-    return strip_country_code(sender) == strip_country_code(cfg.adminPhone);
+    std::string admin = canonical_phone(cfg.adminPhone);
+    return !admin.empty() && canonical_phone(sender) == admin;
 }
 
 struct AdminSmsTaskArg {
@@ -455,7 +469,7 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
 {
     int64_t now = esp_timer_get_time();
     for (auto& slot : s_concat) {
-        if (slot.active && slot.ref == ref && slot.sender == sender) return slot;
+        if (slot.active && slot.ref == ref && slot.sender == sender && slot.total == total) return slot;
     }
     for (auto& slot : s_concat) {
         if (!slot.active || now - slot.lastUs > CONCAT_TIMEOUT_US) {
@@ -773,11 +787,13 @@ static void fetch_stored_sms_by_index(int idx)
     bool has_pdu_line = extract_first_stored_pdu(resp, "+CMGR:", pdu_line);
     bool decoded = has_pdu_line && decode_pdu_line(pdu_line);
     if (has_header) {
-        if (has_pdu_line) {
-            if (!decoded) idf_logf("PDU 无法解析(索引=%d)，删除以释放 SIM 存储", idx);
+        if (decoded) {
             snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", idx);
             std::string ignored;
             idf_modem_send_at(cmd, 2000, ignored);
+        } else if (has_pdu_line) {
+            idf_logf("PDU 无法解析(索引=%d)，保留 SIM 记录等待后续重试", idx);
+            s_backfill_pending = true;
         } else {
             idf_logf("索引=%d 的短信缺少 PDU 行，等待 CMGL 兜底", idx);
             s_backfill_pending = true;
@@ -804,8 +820,11 @@ static void backfill_stored_sms(bool announce)
     // 连续多轮"有缺 PDU 行的条目且毫无进展"的计数：损坏记录若只重试不删除，
     // 会形成每 ~200ms 一次 AT+CMGL 的永久轮询，把整个 AT 通道饿死
     static uint8_t s_nopdu_stall_rounds = 0;
+    static uint8_t s_decode_stall_rounds = 0;
     int nopdu_idx[BATCH_MAX];
+    int decode_fail_idx[BATCH_MAX];
     int nopdu_count = 0;
+    int decode_fail_count = 0;
     int processed = 0;
     int handled = 0;
     bool more_left = false;
@@ -843,13 +862,15 @@ static void backfill_stored_sms(bool announce)
 
         bool decoded = has_pdu_line && decode_pdu_line(pdu_line);
         if (decoded) ++processed;
-        if (idx >= 0 && has_pdu_line) {
-            if (!decoded) idf_logf("PDU 无法解析(索引=%d)，删除以释放 SIM 存储", idx);
+        if (idx >= 0 && decoded) {
             char cmd[24];
             snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", idx);
             std::string ignored;
             idf_modem_send_at(cmd, 2000, ignored);
             ++handled;
+        } else if (idx >= 0 && has_pdu_line) {
+            idf_logf("PDU 无法解析(索引=%d)，保留 SIM 记录等待后续重试", idx);
+            if (decode_fail_count < BATCH_MAX) decode_fail_idx[decode_fail_count++] = idx;
         } else if (idx >= 0) {
             idf_logf("CMGL 索引=%d 缺少 PDU 行，暂不删除", idx);
             if (nopdu_count < BATCH_MAX) nopdu_idx[nopdu_count++] = idx;
@@ -876,6 +897,26 @@ static void backfill_stored_sms(bool announce)
         }
     } else {
         s_nopdu_stall_rounds = 0;
+    }
+
+    if (decode_fail_count > 0) {
+        if (handled > 0 || processed > 0) {
+            s_decode_stall_rounds = 0;
+            s_backfill_pending = true;
+        } else if (++s_decode_stall_rounds >= 3) {
+            for (int i = 0; i < decode_fail_count; ++i) {
+                idf_logf("索引=%d 连续多轮 PDU 解析失败(记录损坏)，删除以恢复正常轮询", decode_fail_idx[i]);
+                char cmd[24];
+                snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", decode_fail_idx[i]);
+                std::string ignored;
+                idf_modem_send_at(cmd, 2000, ignored);
+            }
+            s_decode_stall_rounds = 0;
+        } else {
+            s_backfill_pending = true;
+        }
+    } else {
+        s_decode_stall_rounds = 0;
     }
 
     if (more_left) s_backfill_pending = true;

@@ -45,17 +45,18 @@ button.sec{background:#e3e6ea;color:#1a1d21;width:auto;margin:0;padding:9px 14px
 </div>
 <script>
 function $(i){return document.getElementById(i)}
-function show(cls,html){var m=$('msg');m.className='msg show '+cls;m.innerHTML=html}
+function show(cls,text){var m=$('msg');m.className='msg show '+cls;m.textContent=text}
+function clearSel(text){var s=$('sel');var o=document.createElement('option');o.value='';o.textContent=text;s.replaceChildren(o)}
 function scan(){
 var b=$('scanBtn');b.disabled=true;b.textContent='扫描中';
 fetch('/wifiscan?_='+Date.now(),{cache:'no-store'}).then(function(r){return r.json()}).then(function(a){
 var s=$('sel');
-if(!a||!a.length){s.innerHTML='<option value="">未发现 WiFi</option>';return}
+if(!a||!a.length){clearSel('未发现 WiFi');return}
 a.sort(function(x,y){return y.rssi-x.rssi});
-s.innerHTML='';
 var o=document.createElement('option');o.value='';o.textContent='共 '+a.length+' 个，请选择';s.appendChild(o);
+s.replaceChildren(o);
 a.forEach(function(w){var e=document.createElement('option');e.value=w.ssid;e.textContent=(w.ssid||'(隐藏网络)')+' · '+w.rssi+'dBm'+(w.enc?' · 加密':' · 开放');s.appendChild(e)});
-}).catch(function(){$('sel').innerHTML='<option value="">扫描失败，请重试</option>'}).finally(function(){b.disabled=false;b.textContent='扫描'});
+}).catch(function(){clearSel('扫描失败，请重试')}).finally(function(){b.disabled=false;b.textContent='扫描'});
 }
 $('sel').onchange=function(){if(this.value){$('ssid').value=this.value;$('pass').focus()}};
 var poll=null,timer=null;
@@ -66,7 +67,7 @@ var b=$('saveBtn');b.disabled=true;b.textContent='连接中…';
 var body='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent($('pass').value);
 fetch('/wificonfig',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded','X-SMS-CSRF':'1'},body:body}).then(function(r){return r.json()}).then(function(d){
 if(!d.success){show('err',d.message||'配置无效');b.disabled=false;b.textContent='保存并连接';return}
-show('info','已保存，正在连接 <b>'+(ssid.replace(/</g,'&lt;'))+'</b> …<br>切换信道时本页可能短暂断开，会自动恢复，请稍候。');
+show('info','已保存，正在连接 '+ssid+' …\n切换信道时本页可能短暂断开，会自动恢复，请稍候。');
 startPoll();
 }).catch(function(){show('info','已提交，正在连接…请稍候。');startPoll()});
 }
@@ -84,9 +85,9 @@ if(tries>=24){clearInterval(poll);poll=null;show('err','连接超时，请确认
 function done(ip){
 if(poll){clearInterval(poll);poll=null}
 var n=15;
-show('ok','✓ 已连接成功！请改用下面地址访问设备（把手机/电脑连回你的 WiFi 后打开）：<br><span class="ip">http://'+ip+'</span><br><span id="cd">配网热点将在 '+n+' 秒后自动关闭…</span>');
+show('ok','已连接成功！请改用 http://'+ip+' 访问设备。配网热点将在 '+n+' 秒后自动关闭…');
 if(timer)clearInterval(timer);
-timer=setInterval(function(){n--;var c=document.getElementById('cd');if(!c)return;if(n>0){c.textContent='配网热点将在 '+n+' 秒后自动关闭…'}else{c.textContent='配网热点已关闭。请连接你的 WiFi 后访问上面的地址。';clearInterval(timer)}},1000);
+timer=setInterval(function(){n--;var m=$('msg');if(!m)return;if(n>0){m.textContent='已连接成功！请改用 http://'+ip+' 访问设备。配网热点将在 '+n+' 秒后自动关闭…'}else{m.textContent='配网热点已关闭。请连接你的 WiFi 后访问上面的地址。';clearInterval(timer)}},1000);
 }
 </script>
 </body>

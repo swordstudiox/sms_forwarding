@@ -102,6 +102,7 @@ esp_err_t idf_config_save_email(bool enabled, const std::string& server, int por
                                 const std::string& send_to, bool preserve_blank_pass);
 esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS]);
 esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::string& number_blacklist);
+esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::string* message);
 esp_err_t idf_config_save_forward_rules(const std::string& rules);
 esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t action,
                                     const std::string& target, const std::string& url,

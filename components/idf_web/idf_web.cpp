@@ -733,6 +733,13 @@ static bool field_blank(const std::string& value)
     return true;
 }
 
+static std::string redact_url_for_log(const std::string& url)
+{
+    size_t cut = url.find_first_of("?#");
+    if (cut == std::string::npos) return url;
+    return url.substr(0, cut) + "?...";
+}
+
 static bool parse_int_strict(const std::string& text, int& out)
 {
     errno = 0;
@@ -1385,7 +1392,17 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (rules_form) {
-        esp_err_t err = idf_config_save_forward_rules(field_text(fields, "forwardRules"));
+        std::string rules = field_text(fields, "forwardRules");
+        std::string rule_error;
+        esp_err_t err = idf_config_validate_forward_rules(rules, &rule_error);
+        if (err != ESP_OK) {
+            set_no_cache_headers(req);
+            std::string msg = "转发规则格式错误";
+            if (!rule_error.empty()) msg += ": " + rule_error;
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg.c_str());
+            return ESP_OK;
+        }
+        err = idf_config_save_forward_rules(rules);
         if (err != ESP_OK) return fail(err);
         return ok("网页保存转发规则");
     }
@@ -3163,7 +3180,7 @@ static esp_err_t handle_ping(httpd_req_t* req)
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"创建任务失败\"}");
     }
 
-    idf_logf("网页端发起后台HTTP payload 请求: %s", url.c_str());
+    idf_logf("网页端发起后台HTTP payload 请求: %s", redact_url_for_log(url).c_str());
     return httpd_resp_sendstr(req, "{\"success\":true,\"running\":true,\"message\":\"已开始后台HTTP payload下载，可继续刷新网页\"}");
 }
 

@@ -85,6 +85,8 @@ struct PushJob {
     std::string sender;
     std::string text;
     std::string timestamp;
+    uint32_t inboxId = 0;
+    uint32_t completionId = 0;
 };
 
 struct ForwardJob {
@@ -104,6 +106,15 @@ struct EmailJob {
     int64_t nextUs = 0;
     std::string subject;
     std::string body;
+    uint32_t inboxId = 0;
+    uint32_t completionId = 0;
+};
+
+struct ForwardCompletion {
+    bool used = false;
+    uint32_t id = 0;
+    uint32_t inboxId = 0;
+    uint8_t remaining = 0;
 };
 
 struct TestJob {
@@ -128,7 +139,9 @@ static std::array<PushJob, PUSH_QUEUE_MAX> s_push_jobs;
 static std::array<ForwardJob, FWD_QUEUE_MAX> s_forward_jobs;
 static std::array<EmailJob, EMAIL_QUEUE_MAX> s_email_jobs;
 static std::array<TestJob, IDF_MAX_PUSH_CHANNELS> s_test_jobs;
+static std::array<ForwardCompletion, PUSH_QUEUE_MAX + EMAIL_QUEUE_MAX> s_forward_completions;
 static bool s_started = false;
+static uint32_t s_next_completion_id = 0;
 static std::atomic<bool> s_busy{false};
 // 通道连续失败冷却状态（仅推送 worker 单任务读写，无需加锁）
 static uint8_t s_channel_fails[IDF_MAX_PUSH_CHANNELS] = {};
@@ -161,6 +174,8 @@ static void cleanup_start_resources()
     s_forward_jobs = {};
     s_email_jobs = {};
     s_test_jobs = {};
+    s_forward_completions = {};
+    s_next_completion_id = 0;
     memset(s_channel_fails, 0, sizeof(s_channel_fails));
     memset(s_channel_cool_until_us, 0, sizeof(s_channel_cool_until_us));
     s_busy.store(false, std::memory_order_relaxed);
@@ -194,6 +209,63 @@ static void note_channel_result(uint8_t ch, bool ok)
 static bool channel_cooling(uint8_t ch, int64_t now)
 {
     return ch < IDF_MAX_PUSH_CHANNELS && s_channel_cool_until_us[ch] > now;
+}
+
+static uint32_t register_forward_completion_locked(uint32_t inbox_id, uint8_t total_targets)
+{
+    if (inbox_id == 0 || total_targets == 0) return 0;
+    for (auto& item : s_forward_completions) {
+        if (item.used) continue;
+        uint32_t next_id = ++s_next_completion_id;
+        if (next_id == 0) next_id = ++s_next_completion_id;
+        item.used = true;
+        item.id = next_id;
+        item.inboxId = inbox_id;
+        item.remaining = total_targets;
+        return item.id;
+    }
+    return 0;
+}
+
+static void note_forward_target_success(uint32_t completion_id)
+{
+    if (completion_id == 0) return;
+    uint32_t inbox_id_to_mark = 0;
+    ensure_init();
+    if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
+        for (auto& item : s_forward_completions) {
+            if (!item.used || item.id != completion_id) continue;
+            if (item.remaining > 0) --item.remaining;
+            if (item.remaining == 0) {
+                inbox_id_to_mark = item.inboxId;
+                item = ForwardCompletion();
+            }
+            break;
+        }
+        xSemaphoreGive(s_mutex);
+    }
+    if (inbox_id_to_mark != 0) idf_inbox_mark_forwarded(inbox_id_to_mark);
+}
+
+static void cancel_forward_completion_locked(uint32_t completion_id)
+{
+    if (completion_id == 0) return;
+    for (auto& item : s_forward_completions) {
+        if (item.used && item.id == completion_id) {
+            item = ForwardCompletion();
+            break;
+        }
+    }
+}
+
+static void cancel_forward_completion(uint32_t completion_id)
+{
+    if (completion_id == 0) return;
+    ensure_init();
+    if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
+        cancel_forward_completion_locked(completion_id);
+        xSemaphoreGive(s_mutex);
+    }
 }
 
 // "YYYY-MM-DD HH:MM:SS" 本地时间；时间未同步返回空串
@@ -1280,7 +1352,8 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
 
 static bool enqueue_push_job_locked(uint8_t ch, const std::string& sender, const std::string& text,
                                     const std::string& timestamp, uint8_t attempts, uint32_t delay_sec,
-                                    bool notify = false)
+                                    bool notify = false, uint32_t inbox_id = 0,
+                                    uint32_t completion_id = 0)
 {
     int slot = -1;
     for (size_t i = 0; i < s_push_jobs.size(); ++i) {
@@ -1302,6 +1375,8 @@ static bool enqueue_push_job_locked(uint8_t ch, const std::string& sender, const
     job.sender = sender;
     job.text = text;
     job.timestamp = timestamp;
+    job.inboxId = inbox_id;
+    job.completionId = completion_id;
     return true;
 }
 
@@ -1313,7 +1388,8 @@ static int push_queue_free_locked()
 }
 
 static bool enqueue_email_job_locked(const std::string& subject, const std::string& body,
-                                     uint8_t attempts = 0, uint32_t delay_sec = 0)
+                                     uint8_t attempts = 0, uint32_t delay_sec = 0,
+                                     uint32_t inbox_id = 0, uint32_t completion_id = 0)
 {
     int slot = -1;
     for (size_t i = 0; i < s_email_jobs.size(); ++i) {
@@ -1333,6 +1409,8 @@ static bool enqueue_email_job_locked(const std::string& subject, const std::stri
     job.nextUs = esp_timer_get_time() + static_cast<int64_t>(delay_sec) * 1000000LL;
     job.subject = subject;
     job.body = body;
+    job.inboxId = inbox_id;
+    job.completionId = completion_id;
     return true;
 }
 
@@ -1454,21 +1532,32 @@ static bool process_forward_one()
     std::string targets;  // 命中的通道名列表，用于一行日志点名去向
     ensure_init();
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
+        int push_targets = 0;
         if (!job.pushQueued) {
-            int push_targets = 0;
             for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
                 if (!(mask & (1u << i))) continue;
                 if (!channel_valid(cfg.pushChannels[i])) continue;
                 ++push_targets;
             }
-            if (push_targets > push_queue_free_locked()) {
-                enqueue_failed = true;
-                push_queue_busy = true;
-            }
-            for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS && !push_queue_busy; ++i) {
+        }
+        bool will_queue_email = email_selected && cfg.emailEnabled && cfg.emailConfigured;
+        uint8_t total_targets = static_cast<uint8_t>(push_targets + (will_queue_email ? 1 : 0));
+        if (push_targets > push_queue_free_locked()) {
+            enqueue_failed = true;
+            push_queue_busy = true;
+        }
+        if (will_queue_email && email_queue_depth_locked() >= static_cast<int>(EMAIL_QUEUE_MAX)) {
+            enqueue_failed = true;
+            email_queue_busy = true;
+        }
+        uint32_t completion_id = enqueue_failed ? 0 : register_forward_completion_locked(job.inboxId, total_targets);
+        if (!enqueue_failed && total_targets > 0 && job.inboxId != 0 && completion_id == 0) enqueue_failed = true;
+        if (!job.pushQueued) {
+            for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS && !enqueue_failed; ++i) {
                 if (!(mask & (1u << i))) continue;
                 if (!channel_valid(cfg.pushChannels[i])) continue;
-                if (enqueue_push_job_locked(i, job.sender, job.text, job.timestamp, 0, 0)) {
+                if (enqueue_push_job_locked(i, job.sender, job.text, job.timestamp, 0, 0, false,
+                                            job.inboxId, completion_id)) {
                     ++dispatched;
                     had_queued_target = true;
                     if (!targets.empty()) targets += "、";
@@ -1481,7 +1570,7 @@ static bool process_forward_one()
             }
             if (dispatched > 0) job.pushQueued = true;
         }
-        if (!push_queue_busy && email_selected && cfg.emailEnabled && cfg.emailConfigured) {
+        if (!enqueue_failed && will_queue_email) {
             // 主题只放正文前若干字符(全文在正文里)，避免超长 Subject 被严格 MTA 拒收
             std::string subject = "短信";
             subject += job.sender;
@@ -1495,12 +1584,15 @@ static bool process_forward_one()
             }
             body += "，内容：";
             body += job.text;
-            email_queued = enqueue_email_job_locked(subject, body);
+            email_queued = enqueue_email_job_locked(subject, body, 0, 0, job.inboxId, completion_id);
             if (email_queued) had_queued_target = true;
             else {
                 enqueue_failed = true;
                 email_queue_busy = true;
             }
+        }
+        if (enqueue_failed && completion_id != 0) {
+            cancel_forward_completion_locked(completion_id);
         }
         xSemaphoreGive(s_mutex);
     } else {
@@ -1527,7 +1619,6 @@ static bool process_forward_one()
     } else {
         idf_logf("转发 id=%u 无有效目标(未启用通道/未配置邮件)", static_cast<unsigned>(job.inboxId));
     }
-    idf_inbox_mark_forwarded(job.inboxId);
     s_busy.store(false, std::memory_order_relaxed);
     return true;
 }
@@ -1576,6 +1667,7 @@ static bool process_push_one()
 
     IdfPushChannel channel;
     if (!idf_config_get_push_channel(job.channel, channel) || !channel_valid(channel)) {
+        cancel_forward_completion(job.completionId);
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
@@ -1584,6 +1676,7 @@ static bool process_push_one()
                               job.timestamp.c_str(), job.notify);
     note_channel_result(job.channel, ok);
     if (ok) {
+        note_forward_target_success(job.completionId);
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
@@ -1591,16 +1684,21 @@ static bool process_push_one()
     job.attempts++;
     if (job.attempts >= PUSH_RETRY_MAX) {
         idf_logf("通道%u 重试%u次仍失败，放弃", static_cast<unsigned>(job.channel + 1), static_cast<unsigned>(job.attempts));
+        cancel_forward_completion(job.completionId);
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
     uint32_t delay = backoff_seconds(job.attempts, static_cast<uint32_t>(job.channel * 7 + job.attempts));
     bool requeued = false;
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
-        requeued = enqueue_push_job_locked(job.channel, job.sender, job.text, job.timestamp, job.attempts, delay, job.notify);
+        requeued = enqueue_push_job_locked(job.channel, job.sender, job.text, job.timestamp,
+                                           job.attempts, delay, job.notify, job.inboxId, job.completionId);
         xSemaphoreGive(s_mutex);
     }
-    if (!requeued) idf_logf("推送重试队列已满，通道%u 本次重试未保留", static_cast<unsigned>(job.channel + 1));
+    if (!requeued) {
+        cancel_forward_completion(job.completionId);
+        idf_logf("推送重试队列已满，通道%u 本次重试未保留", static_cast<unsigned>(job.channel + 1));
+    }
     s_busy.store(false, std::memory_order_relaxed);
     return true;
 }
@@ -1617,6 +1715,7 @@ static bool process_email_one()
             bool purged = false;
             for (auto& j : s_email_jobs) {
                 if (j.used) purged = true;
+                cancel_forward_completion_locked(j.completionId);
                 j = EmailJob();
             }
             xSemaphoreGive(s_mutex);
@@ -1650,6 +1749,7 @@ static bool process_email_one()
 
     bool ok = send_smtp_email(cfg, job.subject, job.body);
     if (ok) {
+        note_forward_target_success(job.completionId);
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
@@ -1657,16 +1757,21 @@ static bool process_email_one()
     job.attempts++;
     if (job.attempts >= PUSH_RETRY_MAX) {
         idf_logf("邮件重试%u次仍失败，放弃", static_cast<unsigned>(job.attempts));
+        cancel_forward_completion(job.completionId);
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
     uint32_t delay = backoff_seconds(job.attempts, static_cast<uint32_t>(job.subject.size() + job.body.size()));
     bool requeued = false;
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
-        requeued = enqueue_email_job_locked(job.subject, job.body, job.attempts, delay);
+        requeued = enqueue_email_job_locked(job.subject, job.body, job.attempts, delay,
+                                            job.inboxId, job.completionId);
         xSemaphoreGive(s_mutex);
     }
-    if (!requeued) idf_log_line("邮件重试队列已满，本次重试未保留");
+    if (!requeued) {
+        cancel_forward_completion(job.completionId);
+        idf_log_line("邮件重试队列已满，本次重试未保留");
+    }
     s_busy.store(false, std::memory_order_relaxed);
     return true;
 }
