@@ -3,6 +3,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "idf_config.h"
+#include "idf_esim.h"
 #include "idf_inbox.h"
 #include "idf_log.h"
 #include "idf_modem.h"
@@ -15,10 +16,16 @@
 
 static const char* TAG = "sms_idf";
 
+static bool s_nvs_was_erased = false;
+
 static void init_nvs()
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // 擦除会连 WiFi 凭据和全部配置一起清掉，设备将回到配网热点等人来救。
+        // 标记下来，等日志系统就绪后大声记一笔，别让"配置凭空消失"变成悬案
+        ESP_LOGE(TAG, "NVS 分区需要擦除重建(%s)，全部配置将丢失!", esp_err_to_name(err));
+        s_nvs_was_erased = true;
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
@@ -36,6 +43,9 @@ extern "C" void app_main(void)
 {
     init_nvs();
     idf_log_init();
+    if (s_nvs_was_erased) {
+        idf_log_line("警告: NVS 分区已被擦除重建，配置与 WiFi 凭据丢失，请重新配网");
+    }
     idf_inbox_init();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -60,6 +70,7 @@ extern "C" void app_main(void)
              static_cast<unsigned>(WEB_INDEX.length),
              static_cast<unsigned>(WEB_APP_CSS.length),
              static_cast<unsigned>(WEB_APP_JS.length));
+    idf_esim_init();  // 注册 SIM 热插拔钩子，换卡后 EID 缓存随之失效
     log_start_result("WiFi", idf_wifi_start(idf_config_get()));
     log_start_result("推送后台 worker", idf_push_start());
     log_start_result("HTTP 服务器", idf_web_start());

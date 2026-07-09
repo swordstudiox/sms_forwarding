@@ -252,7 +252,9 @@ private:
   void digitSwap(const char *number, char *pdu);
   
   int utf8_to_packed7bit(const char *utf8, char *pdu, int *septets, int UDHsize, int availableSpace);
-  int pduGsm7_to_unicode(const char *pdu, int pdulength, char *ascii,char firstchar);
+  // firstchar: 从 UDH 尾随字节取出的首个 septet(0..127)，-1 表示没有。
+  // 不能用 0 当"没有"哨兵：GSM7 编码 0 是合法字符 '@'
+  int pduGsm7_to_unicode(const char *pdu, int pdulength, char *ascii, int firstchar);
 
   int convert_utf8_to_gsm7bit(const char *ascii, char *a7bit, int udhsize, int availableSpace);
   int convert_7bit_to_unicode(unsigned char *a7bit, int length, char *ascii);

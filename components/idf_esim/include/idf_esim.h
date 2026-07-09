@@ -15,6 +15,8 @@ struct IdfEsimProfile {
     std::string profileClass;
 };
 
+// 注册模组"卡身份变化"钩子：SIM 热插拔/换卡后失效 EID 缓存。app_main 启动时调用一次
+void idf_esim_init(void);
 esp_err_t idf_esim_get_eid(std::string& eid, std::string& message);
 esp_err_t idf_esim_list_profiles(std::vector<IdfEsimProfile>& profiles,
                                  std::string& eid,

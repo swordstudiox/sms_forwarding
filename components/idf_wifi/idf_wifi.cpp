@@ -91,7 +91,9 @@ struct ApState {
 static ApState ap_state_snapshot()
 {
     ApState state;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    // portMAX_DELAY：持锁方只做几次赋值(微秒级)。带超时的版本一旦超时会把
+    // "AP 开着"误报成"AP 关闭"，后果是热点该关不关/该答不答
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
         state.mode = s_ap_mode;
         state.manual = s_ap_manual_mode;
         state.ssid = s_ap_ssid;
@@ -522,6 +524,7 @@ static void dns_captive_task(void*)
         if (question_end + 16 > static_cast<int>(sizeof(resp))) continue;
         memcpy(resp, req, question_end);
         resp[2] = 0x81; resp[3] = 0x80;  // standard response, no error
+        resp[4] = 0x00; resp[5] = 0x01;  // 只回带了第一个问题，qdcount 必须同步改成 1
         resp[6] = 0x00; resp[7] = 0x01;  // one A answer
         resp[8] = resp[9] = resp[10] = resp[11] = 0;
         int out = question_end;
@@ -551,32 +554,118 @@ static void start_dns_task_once()
     }
 }
 
+// —— 轻量 mDNS 应答器，只服务 sms.local ——
+// 针对"sms.local 先能用、几分钟后失效"做过的关键修复：
+// 1) 组播成员每 60s 强制退组重加。IGMP snooping 交换机/网状路由在无查询器的
+//    家庭网络里几分钟就老化转发表项，而 lwIP 对已加入的组不会重发 IGMP 报告，
+//    必须周期性 DROP+ADD 逼它重发，否则设备从此收不到任何查询；
+// 2) STA 与 AP 两张网卡同时加组(配网保持期手机在热点侧也能解析)；
+// 3) 来源端口≠5353 的一次性/传统查询按 RFC 6762 §6.7 单播回源端口：复制查询
+//    ID、回带问题段、TTL≤10s、不设 cache-flush，路由器 DNS 代理类客户端才收得到；
+// 4) QU 位按单播应答；AAAA 查询回 NSEC(声明只有 A)，双栈解析器不必等超时；
+// 5) 新加组后主动通告两次，客户端无需等到下次查询。
+
+static constexpr char kMdnsName[] = "\x03sms\x05local";
+
 static bool mdns_query_matches_sms_local(const uint8_t* packet, int len, int offset)
 {
-    static constexpr char kName[] = "\x03sms\x05local";
     int pos = offset;
-    for (size_t i = 0; i < sizeof(kName) - 1; ++i) {
+    for (size_t i = 0; i < sizeof(kMdnsName) - 1; ++i) {
         if (pos >= len) return false;
         char a = static_cast<char>(packet[pos++]);
-        char b = kName[i];
+        char b = kMdnsName[i];
         if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
         if (a != b) return false;
     }
     return pos < len && packet[pos] == 0;
 }
 
-static bool mdns_current_ip(uint8_t out[4])
+// 依据询问方地址选择要通告的 IP：热点网段的客户端给热点 IP，其余给 STA IP
+static bool mdns_pick_ip(uint32_t from_addr, uint8_t out[4])
 {
+    bool ap = ap_state_snapshot().mode;
+    if (ap && (from_addr & inet_addr("255.255.255.0")) == inet_addr("192.168.1.0")) {
+        out[0] = 192; out[1] = 168; out[2] = 1; out[3] = 1;
+        return true;
+    }
     esp_netif_ip_info_t ip = {};
     if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
         memcpy(out, &ip.ip.addr, 4);
         return true;
     }
-    if (ap_state_snapshot().mode) {
+    if (ap) {
         out[0] = 192; out[1] = 168; out[2] = 1; out[3] = 1;
         return true;
     }
     return false;
+}
+
+struct MdnsAnswerPlan {
+    bool wantA = false;
+    bool wantNsec = false;   // AAAA 查询 → NSEC"仅存在 A 记录"
+    bool legacy = false;     // 来源端口≠5353 的传统查询
+    bool unicast = false;    // legacy 或 QU 位
+    uint16_t id = 0;
+    uint16_t firstQtype = 0;
+};
+
+static int mdns_append_name(uint8_t* buf, int out)
+{
+    memcpy(buf + out, kMdnsName, sizeof(kMdnsName) - 1);
+    out += sizeof(kMdnsName) - 1;
+    buf[out++] = 0;
+    return out;
+}
+
+static int mdns_append_ttl(uint8_t* buf, int out, uint32_t ttl)
+{
+    buf[out++] = static_cast<uint8_t>(ttl >> 24);
+    buf[out++] = static_cast<uint8_t>(ttl >> 16);
+    buf[out++] = static_cast<uint8_t>(ttl >> 8);
+    buf[out++] = static_cast<uint8_t>(ttl);
+    return out;
+}
+
+// resp 至少 128 字节：头 12 + 问题 15 + A 记录 25 + NSEC 35 = 87
+static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const uint8_t ip[4])
+{
+    uint32_t ttl = plan.legacy ? 10 : 120;             // RFC 6762 §6.7 传统应答 TTL≤10s
+    uint16_t rrclass = plan.legacy ? 0x0001 : 0x8001;  // 传统应答不设 cache-flush 位
+    int an = (plan.wantA ? 1 : 0) + (plan.wantNsec ? 1 : 0);
+    int out = 0;
+    resp[out++] = static_cast<uint8_t>(plan.id >> 8);
+    resp[out++] = static_cast<uint8_t>(plan.id);
+    resp[out++] = 0x84; resp[out++] = 0x00;            // response + authoritative
+    resp[out++] = 0; resp[out++] = plan.legacy ? 1 : 0;
+    resp[out++] = 0; resp[out++] = static_cast<uint8_t>(an);
+    resp[out++] = 0; resp[out++] = 0;
+    resp[out++] = 0; resp[out++] = 0;
+    if (plan.legacy) {  // 传统应答需回带问题段
+        out = mdns_append_name(resp, out);
+        resp[out++] = static_cast<uint8_t>(plan.firstQtype >> 8);
+        resp[out++] = static_cast<uint8_t>(plan.firstQtype);
+        resp[out++] = 0; resp[out++] = 1;
+    }
+    if (plan.wantA) {
+        out = mdns_append_name(resp, out);
+        resp[out++] = 0; resp[out++] = 1;  // A
+        resp[out++] = static_cast<uint8_t>(rrclass >> 8);
+        resp[out++] = static_cast<uint8_t>(rrclass);
+        out = mdns_append_ttl(resp, out, ttl);
+        resp[out++] = 0; resp[out++] = 4;
+        memcpy(resp + out, ip, 4); out += 4;
+    }
+    if (plan.wantNsec) {
+        out = mdns_append_name(resp, out);
+        resp[out++] = 0; resp[out++] = 0x2F;  // NSEC
+        resp[out++] = static_cast<uint8_t>(rrclass >> 8);
+        resp[out++] = static_cast<uint8_t>(rrclass);
+        out = mdns_append_ttl(resp, out, ttl);
+        resp[out++] = 0; resp[out++] = 14;    // rdlength = 名字 11 + 位图 3
+        out = mdns_append_name(resp, out);    // next domain = 自身
+        resp[out++] = 0; resp[out++] = 1; resp[out++] = 0x40;  // 窗口 0 长度 1，仅类型 1(A)
+    }
+    return out;
 }
 
 static void mdns_sms_task(void*)
@@ -610,82 +699,123 @@ static void mdns_sms_task(void*)
     uint8_t ttl = 255;  // RFC 6762 要求组播 TTL=255
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
-    // 组播成员关系是"按网卡"的：任务启动早于任何网卡拿到 IP，若只在启动时用 INADDR_ANY
-    // 加一次组，STA 连上后不会自动迁移到 STA 网卡——sms.local 就只在 AP 网卡有效，连上
-    // 家里 WiFi 后静默失效。这里跟随"当前生效网卡"的 IP：变化时先退旧组、再在新网卡加组。
-    auto current_if_addr = []() -> uint32_t {
+    auto sta_addr = []() -> uint32_t {
         esp_netif_ip_info_t ip = {};
         if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
             return ip.ip.addr;  // 网络字节序
         }
-        if (ap_state_snapshot().mode) return inet_addr("192.168.1.1");
         return 0;
     };
-    uint32_t joined_if = 0;
-    auto rejoin_if_changed = [&]() {
-        uint32_t cur = current_if_addr();
-        if (cur == joined_if) return;
-        if (joined_if != 0) {
+    auto ap_addr = []() -> uint32_t {
+        return ap_state_snapshot().mode ? inet_addr("192.168.1.1") : 0;
+    };
+    // 退组再加组：既处理网卡/IP 变化，也用于周期性逼 lwIP 重发 IGMP 报告
+    // (对已加入的组重复 ADD 只会加引用计数，不会重发报告)。返回"是否新加入"。
+    auto refresh_membership = [&](uint32_t& tracked, uint32_t cur, bool force) -> bool {
+        if (cur == tracked && !force) return false;
+        bool changed = (cur != tracked);
+        if (tracked != 0) {
             ip_mreq d = {};
             d.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
-            d.imr_interface.s_addr = joined_if;
+            d.imr_interface.s_addr = tracked;
             setsockopt(sock, IPPROTO_IP, IP_DROP_MEMBERSHIP, &d, sizeof(d));
-            joined_if = 0;
+            tracked = 0;
         }
         if (cur != 0) {
             ip_mreq a = {};
             a.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
             a.imr_interface.s_addr = cur;
             if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &a, sizeof(a)) == 0) {
-                joined_if = cur;
-                idf_log_line("mDNS 已在当前网卡加入组播: http://sms.local");
+                tracked = cur;
+                if (changed) {
+                    idf_log_line("mDNS 已加入组播: http://sms.local");
+                    return true;
+                }
             }
         }
+        return false;
     };
-    rejoin_if_changed();
 
+    uint32_t joined_sta = 0;
+    uint32_t joined_ap = 0;
+    int64_t last_refresh_us = esp_timer_get_time();
+    int announce_left = 0;
     uint8_t req[512];
+    uint8_t resp[128];
+
     while (true) {
         sockaddr_in from = {};
         socklen_t from_len = sizeof(from);
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
         // 同配网 DNS：立即报错时让出 CPU，防止 lwIP 内存紧张期高优先级忙等
         if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
-        rejoin_if_changed();  // recv 超时约 1s 一轮，网卡一变(STA 拿到 IP)就迁移组播成员
+
+        // recv 超时约 1s 一轮：网卡一变立即迁移；每 60s 强制刷新对抗 snooping 老化
+        int64_t now_us = esp_timer_get_time();
+        bool force = (now_us - last_refresh_us) >= 60000000LL;
+        if (force) last_refresh_us = now_us;
+        bool newly_joined = refresh_membership(joined_sta, sta_addr(), force);
+        newly_joined = refresh_membership(joined_ap, ap_addr(), force) || newly_joined;
+        if (newly_joined) announce_left = 2;
+        if (announce_left > 0) {
+            // 主动通告：相邻两次天然间隔≥1s(recv 超时节拍)
+            uint8_t ip[4] = {};
+            if (mdns_pick_ip(0, ip)) {
+                MdnsAnswerPlan ann;
+                ann.wantA = true;
+                int n = mdns_build_response(resp, ann, ip);
+                sockaddr_in dst = {};
+                dst.sin_family = AF_INET;
+                dst.sin_port = htons(5353);
+                dst.sin_addr.s_addr = inet_addr("224.0.0.251");
+                sendto(sock, resp, n, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+            }
+            --announce_left;
+        }
+
         if (len < 12) continue;
+        if (req[2] & 0xF8) continue;  // 忽略响应包(QR=1)与非标准 opcode
+
         uint16_t qd = (static_cast<uint16_t>(req[4]) << 8) | req[5];
         int pos = 12;
-        bool match = false;
-        for (uint16_t q = 0; q < qd && pos + 5 < len; ++q) {
-            if (mdns_query_matches_sms_local(req, len, pos)) match = true;
-            while (pos < len && req[pos] != 0) pos += req[pos] + 1;
-            pos += 5;
+        MdnsAnswerPlan plan;
+        plan.legacy = (from.sin_port != htons(5353));
+        if (plan.legacy) plan.id = (static_cast<uint16_t>(req[0]) << 8) | req[1];
+        for (uint16_t q = 0; q < qd && pos < len; ++q) {
+            bool matched = mdns_query_matches_sms_local(req, len, pos);
+            // 跳过名字：0xC0 开头的压缩指针是 2 字节终结符，不能当长度前缀
+            while (pos < len) {
+                uint8_t b = req[pos];
+                if (b == 0) { pos += 1; break; }
+                if (b >= 0xC0) { pos += 2; break; }
+                pos += b + 1;
+            }
+            if (pos + 4 > len) break;
+            uint16_t qtype = (static_cast<uint16_t>(req[pos]) << 8) | req[pos + 1];
+            uint16_t qclass = (static_cast<uint16_t>(req[pos + 2]) << 8) | req[pos + 3];
+            pos += 4;
+            if (!matched) continue;
+            if (qtype == 1 || qtype == 255) plan.wantA = true;
+            else if (qtype == 28) plan.wantNsec = true;
+            else continue;
+            if (plan.firstQtype == 0) plan.firstQtype = qtype;
+            if (qclass & 0x8000) plan.unicast = true;  // QU 位：请求单播应答
         }
+        if (!plan.wantA && !plan.wantNsec) continue;
+        if (plan.legacy) plan.unicast = true;
+
         uint8_t ip[4] = {};
-        if (!match || !mdns_current_ip(ip)) continue;
-
-        uint8_t resp[96];
-        int out = 0;
-        resp[out++] = 0; resp[out++] = 0;      // mDNS transaction id
-        resp[out++] = 0x84; resp[out++] = 0x00; // response + authoritative
-        resp[out++] = 0; resp[out++] = 0;      // questions
-        resp[out++] = 0; resp[out++] = 1;      // answers
-        resp[out++] = 0; resp[out++] = 0;      // authority
-        resp[out++] = 0; resp[out++] = 0;      // additional
-        resp[out++] = 3; memcpy(resp + out, "sms", 3); out += 3;
-        resp[out++] = 5; memcpy(resp + out, "local", 5); out += 5;
-        resp[out++] = 0;
-        resp[out++] = 0; resp[out++] = 1;      // A
-        resp[out++] = 0x80; resp[out++] = 1;   // cache-flush + IN
-        resp[out++] = 0; resp[out++] = 0; resp[out++] = 0; resp[out++] = 120;
-        resp[out++] = 0; resp[out++] = 4;
-        memcpy(resp + out, ip, 4); out += 4;
-
+        if (!mdns_pick_ip(from.sin_addr.s_addr, ip)) continue;
+        int n = mdns_build_response(resp, plan, ip);
         sockaddr_in dst = {};
-        dst.sin_family = AF_INET;
-        dst.sin_port = htons(5353);
-        dst.sin_addr.s_addr = inet_addr("224.0.0.251");
-        sendto(sock, resp, out, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+        if (plan.unicast) {
+            dst = from;
+        } else {
+            dst.sin_family = AF_INET;
+            dst.sin_port = htons(5353);
+            dst.sin_addr.s_addr = inet_addr("224.0.0.251");
+        }
+        sendto(sock, resp, n, 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
     }
 }
 

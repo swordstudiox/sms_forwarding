@@ -85,7 +85,7 @@ struct PushJob {
     std::string sender;
     std::string text;
     std::string timestamp;
-    uint32_t inboxId = 0;
+    uint32_t inboxId = 0;  // 关联的收件箱条目；最终放弃时回改"未转发"供手动重发
     uint32_t completionId = 0;
 };
 
@@ -106,7 +106,7 @@ struct EmailJob {
     int64_t nextUs = 0;
     std::string subject;
     std::string body;
-    uint32_t inboxId = 0;
+    uint32_t inboxId = 0;  // 同 PushJob：投递最终失败时回改收件箱标记
     uint32_t completionId = 0;
 };
 
@@ -344,6 +344,23 @@ static std::string json_escape(const std::string& value)
     return out;
 }
 
+// 短信内容不可信，进入 HTML 模板的通道(如 pushplus)必须先转义标签字符
+static std::string html_escape(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size() + 16);
+    for (char ch : value) {
+        switch (ch) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            default: out += ch; break;
+        }
+    }
+    return out;
+}
+
 static void json_prop(std::string& out, const char* key, const std::string& value)
 {
     out += "\"";
@@ -368,17 +385,6 @@ static std::string url_encode(const std::string& value)
         }
     }
     return out;
-}
-
-static std::string replace_all(std::string value, const char* needle, const std::string& replacement)
-{
-    size_t pos = 0;
-    size_t len = strlen(needle);
-    while ((pos = value.find(needle, pos)) != std::string::npos) {
-        value.replace(pos, len, replacement);
-        pos += replacement.size();
-    }
-    return value;
 }
 
 static std::string hmac_sha256_base64(const std::string& data, const std::string& key)
@@ -532,13 +538,26 @@ static bool bark_reserved_param(const std::string& key)
     return key == "title" || key == "body" || key == "device_key" || key == "device_keys";
 }
 
-static std::string apply_push_placeholders(std::string value, const std::string& sender,
+static std::string apply_push_placeholders(const std::string& value, const std::string& sender,
                                            const std::string& text, const std::string& timestamp)
 {
-    value = replace_all(value, "{sender}", sender);
-    value = replace_all(value, "{message}", text);
-    value = replace_all(value, "{timestamp}", timestamp);
-    return value;
+    // 单次扫描替换，避免发送者/内容里出现的 {message} 等字面量被二次展开
+    std::string out;
+    out.reserve(value.size() + text.size());
+    size_t pos = 0;
+    while (pos < value.size()) {
+        size_t brace = value.find('{', pos);
+        if (brace == std::string::npos) {
+            out.append(value, pos, std::string::npos);
+            break;
+        }
+        out.append(value, pos, brace - pos);
+        if (value.compare(brace, 8, "{sender}") == 0) { out += sender; pos = brace + 8; }
+        else if (value.compare(brace, 9, "{message}") == 0) { out += text; pos = brace + 9; }
+        else if (value.compare(brace, 11, "{timestamp}") == 0) { out += timestamp; pos = brace + 11; }
+        else { out += '{'; pos = brace + 1; }
+    }
+    return out;
 }
 
 static void append_bark_params(std::string& json, const std::string& params,
@@ -995,13 +1014,15 @@ static bool smtp_conn_write_all(SmtpConn& conn, const std::string& data)
 
 static bool smtp_final_line_code(const std::string& line, int& code)
 {
-    if (line.size() < 4 ||
+    if (line.size() < 3 ||
         !isdigit(static_cast<unsigned char>(line[0])) ||
         !isdigit(static_cast<unsigned char>(line[1])) ||
         !isdigit(static_cast<unsigned char>(line[2]))) {
         return false;
     }
     code = (line[0] - '0') * 100 + (line[1] - '0') * 10 + (line[2] - '0');
+    // RFC 5321 允许仅三位码无文本的终结行；第 4 字符为 '-' 才是多行中间行
+    if (line.size() == 3) return true;
     return line[3] == ' ';
 }
 
@@ -1093,23 +1114,41 @@ static std::string smtp_date_utc()
     return std::string(buf);
 }
 
-static std::string dot_stuff_body(const std::string& body)
+// RFC 2047: 单个 encoded-word 不得超 75 字符，长主题按 UTF-8 边界分段并折行
+static std::string encode_subject_words(const std::string& subject)
 {
     std::string out;
-    out.reserve(body.size() + 16);
-    bool line_start = true;
-    for (char ch : body) {
-        if (ch == '\r') continue;
-        if (line_start && ch == '.') out += '.';
-        if (ch == '\n') {
-            out += "\r\n";
-            line_start = true;
-        } else {
-            out += ch;
-            line_start = false;
+    size_t pos = 0;
+    while (pos < subject.size()) {
+        size_t take = subject.size() - pos;
+        if (take > 45) take = 45;  // base64(45 字节)=60 字符，加前后缀共 72 < 75
+        // 不从 UTF-8 连续字节中间截断
+        while (take > 1 && pos + take < subject.size() &&
+               (static_cast<unsigned char>(subject[pos + take]) & 0xC0) == 0x80) {
+            --take;
         }
+        std::string chunk64 = base64_encode_string(subject.substr(pos, take));
+        if (chunk64.empty()) return {};
+        if (!out.empty()) out += "\r\n ";
+        out += "=?UTF-8?B?" + chunk64 + "?=";
+        pos += take;
     }
-    if (out.size() < 2 || out.substr(out.size() - 2) != "\r\n") out += "\r\n";
+    return out;
+}
+
+// 正文统一 base64 编码(76 字符折行): 同时规避 8BITMIME 兼容性与 998 字节行长上限，
+// base64 字符集不含 '.'，也无需再做点填充
+static std::string base64_wrap76(const std::string& data)
+{
+    std::string b64 = base64_encode_string(data);
+    std::string out;
+    out.reserve(b64.size() + b64.size() / 76 * 2 + 4);
+    for (size_t i = 0; i < b64.size(); i += 76) {
+        size_t take = b64.size() - i;
+        if (take > 76) take = 76;
+        out.append(b64, i, take);
+        out += "\r\n";
+    }
     return out;
 }
 
@@ -1160,18 +1199,18 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
 
     std::string user64 = base64_encode_string(cfg.smtpUser);
     std::string pass64 = base64_encode_string(cfg.smtpPass);
-    std::string subject64 = base64_encode_string(header_safe(subject));
-    std::string safe_subject = subject64.empty() ? header_safe(subject) : ("=?UTF-8?B?" + subject64 + "?=");
+    std::string subject_words = encode_subject_words(header_safe(subject));
+    std::string safe_subject = subject_words.empty() ? header_safe(subject) : subject_words;
     std::string message;
-    message.reserve(body.size() + 512);
+    message.reserve(body.size() * 2 + 512);
     message += "From: sms notify <" + from + ">\r\n";
     message += "To: <" + to + ">\r\n";
     message += "Subject: " + safe_subject + "\r\n";
     message += "Date: " + smtp_date_utc() + "\r\n";
     message += "MIME-Version: 1.0\r\n";
     message += "Content-Type: text/plain; charset=UTF-8\r\n";
-    message += "Content-Transfer-Encoding: 8bit\r\n\r\n";
-    message += dot_stuff_body(body);
+    message += "Content-Transfer-Encoding: base64\r\n\r\n";
+    message += base64_wrap76(body);
     message += ".\r\n";
 
     ok = smtp_expect(conn, 220) &&
@@ -1266,12 +1305,14 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             break;
         }
         case PUSH_TYPE_PUSHPLUS: {
-            url = channel.url.empty() ? "http://www.pushplus.plus/send" : channel.url;
+            url = channel.url.empty() ? "https://www.pushplus.plus/send" : channel.url;
             std::string push_channel = channel.key2.empty() ? "wechat" : channel.key2;
             if (push_channel != "wechat" && push_channel != "extension" && push_channel != "app") push_channel = "wechat";
+            std::string text_html = json_escape(html_escape(text));
+            std::string sender_html = json_escape(html_escape(sender));
             std::string pp_content = notify
-                ? (text_json + time_html_json)
-                : ("<b>发送者:</b> " + sender_json + time_html_json + "<br><b>内容:</b><br>" + text_json);
+                ? (text_html + time_html_json)
+                : ("<b>发送者:</b> " + sender_html + time_html_json + "<br><b>内容:</b><br>" + text_html);
             body = "{\"token\":\"" + json_escape(channel.key1) + "\",\"title\":\"" + title_json +
                    "\",\"content\":\"" + pp_content + "\",\"channel\":\"" + push_channel + "\"}";
             break;
@@ -1299,17 +1340,15 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
         }
         case PUSH_TYPE_CUSTOM:
             url = channel.url;
-            body = channel.customBody;
-            body = replace_all(body, "{sender}", sender_json);
-            body = replace_all(body, "{message}", text_json);
-            body = replace_all(body, "{timestamp}", ts_json);
+            body = apply_push_placeholders(channel.customBody, sender_json, text_json, ts_json);
             break;
         case PUSH_TYPE_FEISHU:
             url = channel.url;
             body = "{";
             if (!channel.key1.empty()) {
                 int64_t ts = time(nullptr);
-                std::string sign = hmac_sha256_base64(std::to_string(ts) + "\n" + channel.key1, channel.key1);
+                // 飞书签名与钉钉相反: 以 ts+"\n"+secret 为密钥、空串为消息做 HMAC-SHA256
+                std::string sign = hmac_sha256_base64("", std::to_string(ts) + "\n" + channel.key1);
                 body += "\"timestamp\":\"" + std::to_string(ts) + "\",\"sign\":\"" + sign + "\",";
             }
             body += notify
@@ -1685,6 +1724,8 @@ static bool process_push_one()
     if (job.attempts >= PUSH_RETRY_MAX) {
         idf_logf("通道%u 重试%u次仍失败，放弃", static_cast<unsigned>(job.channel + 1), static_cast<unsigned>(job.attempts));
         cancel_forward_completion(job.completionId);
+        // 投递最终失败：把收件箱条目改回"未转发"，让丢失可见、可手动重发
+        if (job.inboxId) idf_inbox_set_forwarded(job.inboxId, false);
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
@@ -1698,6 +1739,7 @@ static bool process_push_one()
     if (!requeued) {
         cancel_forward_completion(job.completionId);
         idf_logf("推送重试队列已满，通道%u 本次重试未保留", static_cast<unsigned>(job.channel + 1));
+        if (job.inboxId) idf_inbox_set_forwarded(job.inboxId, false);
     }
     s_busy.store(false, std::memory_order_relaxed);
     return true;
@@ -1758,6 +1800,8 @@ static bool process_email_one()
     if (job.attempts >= PUSH_RETRY_MAX) {
         idf_logf("邮件重试%u次仍失败，放弃", static_cast<unsigned>(job.attempts));
         cancel_forward_completion(job.completionId);
+        // 同推送：最终失败回改"未转发"，避免收件箱假装已送达
+        if (job.inboxId) idf_inbox_set_forwarded(job.inboxId, false);
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
@@ -1771,6 +1815,7 @@ static bool process_email_one()
     if (!requeued) {
         cancel_forward_completion(job.completionId);
         idf_log_line("邮件重试队列已满，本次重试未保留");
+        if (job.inboxId) idf_inbox_set_forwarded(job.inboxId, false);
     }
     s_busy.store(false, std::memory_order_relaxed);
     return true;

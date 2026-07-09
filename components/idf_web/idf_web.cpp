@@ -34,6 +34,7 @@
 #include "idf_wifi.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/sha256.h"
+#include "nvs.h"
 #include "web_assets.h"
 
 static const char* TAG = "idf_web";
@@ -207,6 +208,32 @@ static bool is_ap_open_uri(const char* uri)
     return false;
 }
 
+// 跨站 POST 防护：浏览器发起的跨站表单/fetch 必带 Origin，与 Host 不一致即拒绝。
+// 变更类操作均已强制 POST，GET 一律放行；curl/脚本不带 Origin 不受影响。
+static bool origin_allowed(httpd_req_t* req)
+{
+    if (req->method != HTTP_POST) return true;
+    char origin[160] = {};
+    if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) != ESP_OK) return true;
+    if (strcmp(origin, "null") == 0) return false;  // 沙箱 iframe 等匿名来源
+    const char* host_part = origin;
+    const char* scheme_end = strstr(origin, "://");
+    if (scheme_end) host_part = scheme_end + 3;
+    char host[128] = {};
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) return false;
+    return strcasecmp(host_part, host) == 0;
+}
+
+static bool reject_cross_origin(httpd_req_t* req)
+{
+    if (origin_allowed(req)) return false;
+    idf_log_line("已拦截跨站 POST(Origin 与 Host 不符)");
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "Cross-origin request rejected");
+    return true;
+}
+
 static bool check_auth(httpd_req_t* req)
 {
     // 配网热点(开放 AP)模式下放行配网所需接口：设备此时是开放无加密热点，系统
@@ -214,6 +241,7 @@ static bool check_auth(httpd_req_t* req)
     // 配网页面(见 issue #1)；且开放空口上 Basic 凭据本就明文可嗅探，对这几个
     // 只读/配网接口强制认证意义不大。导出/导入/OTA/发短信/收件箱等敏感接口不在
     // 白名单内，仍需认证，避免开放热点期间泄露密钥或被滥用。
+    if (reject_cross_origin(req)) return false;
     if (idf_wifi_is_ap_mode() && is_ap_open_uri(req->uri)) return true;
 
     char auth[512] = {};
@@ -1459,6 +1487,7 @@ static esp_err_t handle_save(httpd_req_t* req)
             arg->dataChanged = data_changed;
             arg->operatorChanged = operator_changed;
             arg->dataEnabled = after.dataEnabled;
+            arg->roamingEnabled = after.roamingEnabled;  // 不带上它，漫游关闭的立即生效保护永远不触发
             arg->apn = after.apn;
             arg->operatorPlmn = after.operatorPlmn;
             if (xTaskCreate(modem_apply_task, "idf_sim_apply", 4096, arg, 3, nullptr) != pdPASS) {
@@ -2975,11 +3004,32 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
     return true;
 }
 
+// 心跳"上次发送日"落盘：重启会清掉内存标记，若重启恰在心跳小时内(如每日重启
+// 与心跳同小时)，不落盘会当天重复发送。每天最多写一次，NVS 磨损可忽略。
+static int64_t load_hb_last_day()
+{
+    nvs_handle_t h;
+    if (nvs_open("sms_state", NVS_READONLY, &h) != ESP_OK) return -1;
+    uint32_t v = 0;
+    int64_t day = (nvs_get_u32(h, "hb_day", &v) == ESP_OK) ? static_cast<int64_t>(v) : -1;
+    nvs_close(h);
+    return day;
+}
+
+static void store_hb_last_day(int64_t day)
+{
+    nvs_handle_t h;
+    if (nvs_open("sms_state", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u32(h, "hb_day", static_cast<uint32_t>(day));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 static void scheduler_task(void*)
 {
     uint32_t last_ka_check_ms = 0;
     bool prev_ka_enabled = false;
-    int64_t hb_last_day = -1;
+    int64_t hb_last_day = load_hb_last_day();
     int64_t rb_last_day = -1;
 
     while (true) {
@@ -3065,6 +3115,7 @@ static void scheduler_task(void*)
             // 用 > 而非 !=：NTP 回拨跨过本地午夜会让 day 变小，!= 会当天重复触发
             if (cfg.hbEnabled && hour == cfg.hbHour && day > hb_last_day) {
                 hb_last_day = day;
+                store_hb_last_day(day);
                 IdfSmsStatus sms = idf_sms_get_status();
                 char body[192];
                 snprintf(body, sizeof(body), "设备运行正常。\n累计转发: %u 条\n空闲堆: %u KB",

@@ -45,7 +45,14 @@
         [480,'UTC+8 北京/香港'], [540,'UTC+9 东京'], [420,'UTC+7 曼谷'], [330,'UTC+5:30 印度'],
         [60,'UTC+1 中欧'], [0,'UTC/GMT'], [-300,'UTC-5 纽约'], [-360,'UTC-6 芝加哥'], [-480,'UTC-8 洛杉矶']
       ];
-      return zones.map(function(z){ return '<option value="' + z[0] + '"' + (z[0] == sel ? ' selected' : '') + '>' + z[1] + '</option>'; }).join('');
+      var html = zones.map(function(z){ return '<option value="' + z[0] + '"' + (z[0] == sel ? ' selected' : '') + '>' + z[1] + '</option>'; }).join('');
+      // 导入的配置可能带非预置时区值：不追加选中项的话浏览器会回落到第一项，
+      // 下次"保存时间"就把时区悄悄改写成 UTC+8
+      var known = zones.some(function(z){ return z[0] == sel; });
+      if (!known && sel !== undefined && sel !== null && sel !== '') {
+        html += '<option value="' + parseInt(sel, 10) + '" selected>UTC 偏移 ' + parseInt(sel, 10) + ' 分钟</option>';
+      }
+      return html;
     }
     function pushTypeOptions(type) {
       var opts = [
@@ -674,7 +681,12 @@
         addLog(d.message,d.success?'resp':'error');
       }).catch(function(e){addLog('网络错误: '+e,'error')}).finally(function(){btn.disabled=false;btn.textContent='发送';});
     }
-    function atQuick(cmd){var inp=document.getElementById('atCmd');if(!inp)return;inp.value=cmd;sendAT();}
+    function atQuick(cmd){
+      var inp=document.getElementById('atCmd');if(!inp)return;
+      var btn=document.getElementById('atBtn');
+      if(btn&&btn.disabled)return;  // 上一条在途：不覆盖用户草稿，sendAT 反正也会拒发
+      inp.value=cmd;sendAT();
+    }
     function clearATLog(){var l=document.getElementById('atLog');if(!l)return;l.innerHTML='';addLog('日志已清空','resp');}
     function bindAtTerminal(){
       var el = document.getElementById('atCmd');
@@ -700,7 +712,7 @@
     }
 
     // ---- Log Viewer (进入页/手动刷新重放保留日志，自动刷新只追新增) ----
-    var logTimer = null, logSince = 0, logLines = [], logLoading = false;
+    var logTimer = null, logSince = 0, logLines = [], logLoading = false, logReqSeq = 0;
     function startLogPoll() {
       if (logTimer) return;
       logTimer = setInterval(refreshLog, 2000);
@@ -784,7 +796,17 @@
       var reqSince = fullReload ? 0 : logSince;
       logLoading = true;
       if (fullReload) setLogStatus('正在加载设备端保留日志...');
-      fetch('/log?since=' + reqSince + '&_=' + Date.now(), { cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
+      // 挂死的请求会永久卡住 logLoading，2s 轮询从此空转：8s 后主动中断/放行
+      var myReq = ++logReqSeq;
+      var ctrl = window.AbortController ? new AbortController() : null;
+      var opt = { cache: 'no-store' };
+      if (ctrl) opt.signal = ctrl.signal;
+      var timeoutId = setTimeout(function() {
+        if (myReq !== logReqSeq) return;
+        if (ctrl) ctrl.abort();
+        else logLoading = false;
+      }, 8000);
+      fetch('/log?since=' + reqSince + '&_=' + Date.now(), opt).then(jsonOrThrow).then(function(d) {
         if (!panelActive('log')) return;
         if (!d || !Array.isArray(d.lines)) return;
         if (fullReload || d.seq < logSince) logLines = [];  // 重载/设备重启 -> 重置
@@ -804,7 +826,8 @@
           setLogStatus('日志请求失败');
         }
       }).finally(function() {
-        logLoading = false;
+        clearTimeout(timeoutId);
+        if (myReq === logReqSeq) logLoading = false;
       });
     }
     // ---- Keep-Alive (保号) ----
@@ -862,6 +885,9 @@
     function kaPollRunStatus() {
       if (kaRunTimer) clearTimeout(kaRunTimer);
       fetch('/keepalive?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
+        // 切走面板后停止轮询：否则请求在途时的 .then 会重臂定时器，
+        // 轮询在其他面板上一直弹 toast，还会覆盖诊断页正在输入的 URL
+        if (!panelActive('keepalive')) return;
         if (d.jobQueued || d.jobRunning) {
           showToast(d.jobMessage || '保号动作后台执行中…', 'loading');
           kaRunTimer = setTimeout(kaPollRunStatus, 1500);
@@ -871,7 +897,7 @@
           showToast(d.jobMessage || (d.jobSuccess ? '保号动作已完成' : '保号动作失败'), d.jobSuccess ? 'ok' : 'err');
           kaLoadStatus();
         }
-      }).catch(function(e){ showToast('状态查询失败: ' + e, 'err'); });
+      }).catch(function(e){ if (panelActive('keepalive')) showToast('状态查询失败: ' + e, 'err'); });
     }
     function kaRun() {
       showToast('正在保存并提交保号任务…', 'loading');
@@ -902,12 +928,18 @@
         return {v: id, t: label};
       }).filter(function(o){ return o.v; });
     }
+    var esimOptionsReq = null;  // 在途请求去重：面板初始化会同时发起 7 次调用
     function loadEsimOptions(cb) {
       if (esimOptions) { cb(esimOptions); return; }
-      fetch('/esim?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
-        esimOptions = profileOptionsFromProfiles(d.profiles);
-        cb(esimOptions);
-      }).catch(function(){ cb([]); });
+      if (!esimOptionsReq) {
+        esimOptionsReq = fetch('/esim?action=status&_=' + Date.now(), {cache:'no-store'})
+          .then(jsonOrThrow).then(function(d) {
+            esimOptions = profileOptionsFromProfiles(d.profiles);
+            return esimOptions;
+          }).catch(function(){ return []; })
+          .then(function(opts){ esimOptionsReq = null; return opts; });
+      }
+      esimOptionsReq.then(cb);
     }
     // 三件套约定：hiddenId(实际提交) / hiddenId+'Sel'(下拉) / hiddenId+'Custom'(手动输入)
     function profSelChange(hiddenId) {
@@ -1216,7 +1248,13 @@
         if (finished || seq !== statusSeq) return;
         timedOut = true;
         if (ctrl) ctrl.abort();
-        else ovSet('ovRefresh', '刷新超时');
+        else {
+          // 无 AbortController 时不能真中断：同步放开 statusLoading 闸门，
+          // 否则一个挂死的 /status 会永久冻结概览刷新
+          ovSet('ovRefresh', '刷新超时');
+          finished = true;
+          statusLoading = false;
+        }
       }, 7000);
       var url = '/status?' + (sample ? 'sample=1&' : '') + '_=' + Date.now();
       fetch(url, opt).then(jsonOrThrow).then(function(d) {
@@ -1853,7 +1891,15 @@
       if (!panelActive('overview')) return;
       if (latestOtpLoading) return;
       latestOtpLoading = true;
-      fetch('/messages?limit=1&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(arr) {
+      // 同 refreshLog：挂死请求不能永久卡住轮询闸门
+      var ctrl = window.AbortController ? new AbortController() : null;
+      var opt = {cache:'no-store'};
+      if (ctrl) opt.signal = ctrl.signal;
+      var timeoutId = setTimeout(function() {
+        if (ctrl) ctrl.abort();
+        else latestOtpLoading = false;
+      }, 8000);
+      fetch('/messages?limit=1&_=' + Date.now(), opt).then(jsonOrThrow).then(function(arr) {
         if (!panelActive('overview')) return;
         var card = document.getElementById('otpHeroCard');
         if (!card) return;
@@ -1870,7 +1916,7 @@
         if (otp) { code.textContent = otp; code.onclick = function(){ copyText(otp, code); }; code.style.display = ''; } else { code.style.display = 'none'; }
         card.style.display = '';
         if (!m.fwd && panelActive('overview')) latestOtpTimer = setTimeout(loadLatestOtp, 1500);  // 刚入库时转发拆分可能下一帧才标记完成
-      }).catch(function(){}).then(function(){ latestOtpLoading = false; });
+      }).catch(function(){}).then(function(){ clearTimeout(timeoutId); latestOtpLoading = false; });
     }
 
     document.addEventListener('DOMContentLoaded', function() {

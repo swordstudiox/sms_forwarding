@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <array>
+#include <atomic>
 
 #include "esp_attr.h"
 #include "esp_system.h"
@@ -22,6 +23,9 @@ static constexpr size_t LOG_LINE_MAX = 192;
 static SemaphoreHandle_t s_log_mutex = nullptr;
 static std::array<std::string, LOG_RING_SIZE> s_lines;
 static uint32_t s_seq = 0;
+// s_seq 的无锁镜像：锁竞争超时的降级路径也能返回真实序号。
+// 返回 seq=0 会被网页当成"设备重启过"，触发清屏+全量重放
+static std::atomic<uint32_t> s_seq_mirror{0};
 static size_t s_count = 0;
 static size_t s_next = 0;
 
@@ -326,6 +330,7 @@ void idf_log_line(const char* line)
     s_next = (s_next + 1) % LOG_RING_SIZE;
     if (s_count < LOG_RING_SIZE) ++s_count;
     ++s_seq;
+    s_seq_mirror.store(s_seq, std::memory_order_relaxed);
     xSemaphoreGive(s_log_mutex);
 }
 
@@ -334,8 +339,20 @@ void idf_logf(const char* fmt, ...)
     char buf[LOG_LINE_MAX + 1];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    int ret = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    if (ret > static_cast<int>(LOG_LINE_MAX)) {
+        // vsnprintf 截断可能落在多字节字符中间；退到 UTF-8 边界，避免输出乱码
+        size_t end = LOG_LINE_MAX;
+        size_t p = end;
+        while (p > 0 && (static_cast<unsigned char>(buf[p - 1]) & 0xC0) == 0x80) --p;
+        if (p > 0) {
+            unsigned char lead = static_cast<unsigned char>(buf[p - 1]);
+            size_t need = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3 : (lead >= 0xC0) ? 2 : 1;
+            if (need > 1 && p - 1 + need > end) end = p - 1;  // 末字符不完整，整个去掉
+        }
+        buf[end] = '\0';
+    }
     idf_log_line(buf);
 }
 
@@ -346,7 +363,11 @@ std::string idf_log_json_since(uint32_t since)
     out.reserve(2048);
 
     if (!s_log_mutex || xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-        return "{\"seq\":0,\"lines\":[]}";
+        // 返回最近已知序号而非 0：seq 回退会被网页误判为设备重启，清屏重放
+        char fallback[48];
+        snprintf(fallback, sizeof(fallback), "{\"seq\":%" PRIu32 ",\"lines\":[]}",
+                 s_seq_mirror.load(std::memory_order_relaxed));
+        return fallback;
     }
 
     uint32_t seq = s_seq;

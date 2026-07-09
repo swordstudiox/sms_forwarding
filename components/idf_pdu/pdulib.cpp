@@ -639,7 +639,7 @@ int PDU::convert_7bit_to_unicode(unsigned char *gsm7bit, int length, char *unico
   return w;
 }
 
-int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, char firstchar)
+int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, int firstchar)
 {
   if (numSeptets <= 0)
   {
@@ -661,11 +661,11 @@ int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, char
   w = 0;
   int index = 0; // index into the string
   int ovflow = 0;  
-// if first character not zero it was retrieved from udh field, stick it into the final buffer 
-// Issues #28,30
-  if (firstchar != 0)
+// firstchar >= 0 表示它取自 UDH 尾随字节，插入缓冲头部(Issues #28,30)。
+// 0('@')也是合法首字符，判断依据是 >=0 而非 !=0
+  if (firstchar >= 0)
   {
-    gsm7bit[w++] = firstchar;
+    gsm7bit[w++] = static_cast<unsigned char>(firstchar & 0x7F);
   }
 
   for (r = 0; w < numSeptets; r++)
@@ -712,7 +712,7 @@ bool PDU::decodePDU(const char *pdu)
   int outindex = 0;
   int i, dcs, /*pid,*/ tpdu;
   bool udhPresent;
-  char udhfollower = 0;
+  int udhfollower = -1;  // -1=无 UDH 尾随字符；0 是合法的 '@'
 
   unsigned char X;
   const size_t pduHexLen = strlen(pdu);
@@ -893,7 +893,7 @@ bool PDU::decodePDU(const char *pdu)
       return false;
     {
       int septetsFromPdu = dulength;
-      if (udhfollower != 0 && septetsFromPdu > 0) --septetsFromPdu;
+      if (udhfollower >= 0 && septetsFromPdu > 0) --septetsFromPdu;
       if (!canRead(index, ((static_cast<size_t>(septetsFromPdu) * 7 + 7) / 8) * 2))
         return false;
     }
@@ -917,7 +917,7 @@ bool PDU::decodePDU(const char *pdu)
       pdu_to_ucs2(&pdu[index], 2, &ucs2); // treat 2 octets
       index += 4;
       dulength -= 2;
-      char utf8tmp[5] = {};
+      char utf8tmp[8] = {};  // U+FFFD 顶替(3) + 当前字符(≤3)，见 ucs2_to_utf8 注释
       utflength = ucs2_to_utf8(ucs2, utf8tmp);
       // check for overflow
       if ((utfoffset + utflength) >= generalWorkBuffLength) {
@@ -952,17 +952,61 @@ bool PDU::decodePDU(const char *pdu)
 bool SPstart = false;
 unsigned short spair[2]; // save surrogate pair
 
+// 单次调用最多输出 6 字节(孤立高位代理的 U+FFFD 顶替 + 当前字符)，调用方缓冲需 ≥7
 int PDU::ucs2_to_utf8(unsigned short ucs2, char *outbuf)
 {
-  if (/*ucs2>=0 and*/ ucs2 <= 0x7f) // 7F(16) = 127(10)
+  int out = 0;
+  // 上一个字是高位代理：本字必须是低位代理才能组对；否则孤立代理用 U+FFFD 顶替。
+  // 把代理区码点直接按 3 字节编码会产出非法 UTF-8，污染下游 JSON/推送/网页
+  if (SPstart)
   {
-    outbuf[0] = ucs2;
-    return 1;
+    SPstart = false;
+    if (ucs2 >= 0xDC00 && ucs2 <= 0xDFFF)
+    {
+      spair[1] = ucs2;
+      // extract code point from pair
+      unsigned long utf16 = ((spair[0] & ~0xd800) << 10) + (spair[1] & 0x03ff);
+      unsigned char c1 = BITS7654ON, c2 = BIT7ON6OFF, c3 = BIT7ON6OFF, c4 = BIT7ON6OFF;
+      utf16 += 0x10000;
+      for (int k = 0; k < 22; ++k) // 22 bits in pack
+      {
+        if (k < 6) // bits 0-6
+          c4 |= (utf16 % 64) & (1 << k);
+        else if (k < 12) // bits 6-11
+          c3 |= (utf16 >> 6) & (1 << (k - 6));
+        else if (k < 18) // bits 7-18
+          c2 |= (utf16 >> 12) & (1 << (k - 12));
+        else // bits 19-22
+          c1 |= (utf16 >> 18) & (1 << (k - 18));
+      }
+      outbuf[0] = c1;
+      outbuf[1] = c2;
+      outbuf[2] = c3;
+      outbuf[3] = c4;
+      return 4;
+    }
+    // 孤立高位代理 → U+FFFD，随后继续按普通字符处理本字
+    outbuf[out++] = '\xEF'; outbuf[out++] = '\xBF'; outbuf[out++] = '\xBD';
   }
-  else if (ucs2 <= 0x7ff) // 7FF(16) = 2047(10)
+  if (ucs2 >= 0xD800 && ucs2 <= 0xDBFF)
+  { // start of surrogate pair
+    SPstart = true;
+    spair[0] = ucs2;
+    return out;
+  }
+  if (ucs2 >= 0xDC00 && ucs2 <= 0xDFFF)
+  { // 孤立低位代理 → U+FFFD
+    outbuf[out++] = '\xEF'; outbuf[out++] = '\xBF'; outbuf[out++] = '\xBD';
+    return out;
+  }
+  if (ucs2 <= 0x7f) // 7F(16) = 127(10)
+  {
+    outbuf[out++] = static_cast<char>(ucs2);
+    return out;
+  }
+  if (ucs2 <= 0x7ff) // 7FF(16) = 2047(10)
   {
     unsigned char c1 = BITS76ON, c2 = BIT7ON6OFF;
-
     for (int k = 0; k < 11; ++k)
     {
       if (k < 6)
@@ -970,47 +1014,13 @@ int PDU::ucs2_to_utf8(unsigned short ucs2, char *outbuf)
       else
         c1 |= (ucs2 >> 6) & (1 << (k - 6));
     }
-
-    outbuf[0] = c1;
-    outbuf[1] = c2;
-
-    return 2;
+    outbuf[out++] = c1;
+    outbuf[out++] = c2;
+    return out;
   }
-  else if ((ucs2 & 0xff00) >= 0xD800 && ((ucs2 & 0xff00) <= 0xDB00))
-  { // start of surrogate pair
-    SPstart = true;
-    spair[0] = ucs2;
-  }
-  else if (SPstart)
-  {
-    SPstart = false;
-    spair[1] = ucs2;
-    // extract code point from pair
-    unsigned long utf16 = ((spair[0] & ~0xd800) << 10) + (spair[1] & 0x03ff);
-    unsigned char c1 = BITS7654ON, c2 = BIT7ON6OFF, c3 = BIT7ON6OFF, c4 = BIT7ON6OFF;
-    utf16 += 0x10000;
-    for (int k = 0; k < 22; ++k) // 22 bits in pack
-    {
-      if (k < 6) // bits 0-6
-        c4 |= (utf16 % 64) & (1 << k);
-      else if (k < 12) // bits 6-11
-        c3 |= (utf16 >> 6) & (1 << (k - 6));
-      else if (k < 18) // bits 7-18
-        c2 |= (utf16 >> 12) & (1 << (k - 12));
-      else // bits 19-22
-        c1 |= (utf16 >> 18) & (1 << (k - 18));
-    }
-    outbuf[0] = c1;
-    outbuf[1] = c2;
-    outbuf[2] = c3;
-    outbuf[3] = c4;
-
-    return 4;
-  }
-  else // if (ucs2 <= 0xffff)  // FFFF(16) = 65535(10)
+  // BMP 常规字符(≤0xFFFF)
   {
     unsigned char c1 = BITS765ON, c2 = BIT7ON6OFF, c3 = BIT7ON6OFF;
-
     for (int k = 0; k < 16; ++k) // 16 bits in pack
     {
       if (k < 6)
@@ -1020,14 +1030,11 @@ int PDU::ucs2_to_utf8(unsigned short ucs2, char *outbuf)
       else
         c1 |= (ucs2 >> 12) & (1 << (k - 12));
     }
-    outbuf[0] = c1;
-    outbuf[1] = c2;
-    outbuf[2] = c3;
-
-    return 3;
+    outbuf[out++] = c1;
+    outbuf[out++] = c2;
+    outbuf[out++] = c3;
+    return out;
   }
-
-  return 0;
 }
 /*
    return number of bytes used by this UTF8 unicode character
@@ -1156,13 +1163,19 @@ void PDU::BCDtoString(char *output, const char *input, int length)
 */
 int PDU::decodeAddress(const char *pdu, char *output, eLengthType et)
 {                           // pdu to readable starts with length octet
+  // 先清空输出：任何未写 output 的分支若留下上一条短信的号码，
+  // 黑名单/去重/管理员校验都会拿旧发送者判断新短信
+  *output = 0;
   int length = gethex(pdu); // could be nibbles or octets
   // if octets, length include TON so reduce by 1
   // if nibbles length is just the number
   if (et == NIBBLES)
   {
     addressLength = length;
-    if (addressLength > MAX_NUMBER_LENGTH) {
+    // 字母数字型发送方(TON=5)按规范最长 11 octets = 22 nibbles，数字号码最长 20。
+    // 这里先放行到 22，读到 TOA 后再对数字型收紧——否则 12 字符的品牌发送方
+    // 会被当成坏 PDU，上层还会把它从 SIM 里删掉，短信被静默丢失
+    if (addressLength > MAX_NUMBER_LENGTH + 2) {
       *output = 0;
       addressLength = 0;
       return -1;
@@ -1192,7 +1205,14 @@ int PDU::decodeAddress(const char *pdu, char *output, eLengthType et)
   pdu += 2;
   if ((adt & EXT_MASK) != 0)
   {
-    switch ((adt & TON_MASK) >> TON_OFFSET)
+    int ton = (adt & TON_MASK) >> TON_OFFSET;
+    // 数字型号码在此收紧回 20 nibbles(22 的宽限只给字母数字型)
+    if (et == NIBBLES && ton != 5 && addressLength > MAX_NUMBER_LENGTH) {
+      *output = 0;
+      addressLength = 0;
+      return -1;
+    }
+    switch (ton)
     {
     case 1:            // international number
       *output++ = '+'; // add prefix and fall through
@@ -1201,8 +1221,8 @@ int PDU::decodeAddress(const char *pdu, char *output, eLengthType et)
     //  [[fallthrough]]
     case 2: // national number
     //  [[fallthrough]];
-    //case 3: // network specific number, Issue #26
-    //case 6: // abbreviated number, Issue #41
+    case 3: // 网络专用号码(运营商短号常见, Issue #26)：同样按 BCD 数字解码
+    case 6: // 缩位号码(Issue #41)
       BCDtoString(output, pdu, addressLength);
       if ((addressLength & 1) == 1) // if odd, bump 1
         addressLength++;            // we could do this before calling BCDtoString
@@ -1210,7 +1230,7 @@ int PDU::decodeAddress(const char *pdu, char *output, eLengthType et)
     case 5: // alphabetic, convert  nibble length to septets
       {
         char decoded[PDU_ADDRESS_TEXT_BUFFER] = {};
-        pduGsm7_to_unicode(pdu, (addressLength * 4) / 7, decoded,0);
+        pduGsm7_to_unicode(pdu, (addressLength * 4) / 7, decoded, -1);
         strncpy(output, decoded, PDU_ADDRESS_TEXT_BUFFER - 1);
         output[PDU_ADDRESS_TEXT_BUFFER - 1] = 0;
       }
@@ -1218,12 +1238,14 @@ int PDU::decodeAddress(const char *pdu, char *output, eLengthType et)
         addressLength++;            // we could do NOT this before calling pduGsm7_to_unicode
       break;
     default:
+      *output = 0;  // 未知类型：显式清空，绝不沿用上一条的发送者
       addressLength = 0;
       break;
     }
   }
   else
   {
+    *output = 0;
     addressLength = 0; // dont know how to handle EXT
   }
   return addressLength;

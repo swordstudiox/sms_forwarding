@@ -11,6 +11,7 @@
 #include <atomic>
 #include <new>
 #include <string>
+#include <vector>
 
 #include "esp_log.h"
 #include "esp_system.h"
@@ -465,6 +466,8 @@ static std::string assemble_concat(const ConcatSlot& slot)
     return text;
 }
 
+static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw);
+
 static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int total)
 {
     int64_t now = esp_timer_get_time();
@@ -484,6 +487,16 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
     }
     auto oldest = std::min_element(s_concat.begin(), s_concat.end(),
         [](const ConcatSlot& a, const ConcatSlot& b) { return a.lastUs < b.lastUs; });
+    // 槽位全忙被挤占：已收到的分段不能悄悄扔掉——分段可能已从 SIM 删除，丢了
+    // 就再也拿不回。与超时路径一致，先按现状合并转发(缺口有"[缺失分段]"标记)
+    {
+        std::string partial = assemble_concat(*oldest);
+        if (!partial.empty()) {
+            idf_logf("长短信槽位耗尽，先合并已收 %d/%d 段再复用槽位",
+                     oldest->received, oldest->total);
+            process_sms_content(oldest->sender.c_str(), partial.c_str(), oldest->timestamp.c_str());
+        }
+    }
     clear_concat_slot(*oldest);
     oldest->active = true;
     oldest->ref = ref;
@@ -701,7 +714,13 @@ static void process_urc_line(const std::string& raw)
     }
 
     if (s_wait_pdu) {
-        if (starts_with(line, "+CMT:")) return;
+        if (starts_with(line, "+CMT:")) {
+            // 窗口内又来一条 +CMT：前一条的 PDU 已丢(直推短信不落存储无从兜底)，
+            // 重臂窗口至少保住新的这条，并记一笔便于排查
+            idf_log_line("等待直推 PDU 时又收到 +CMT，前一条可能丢失");
+            s_wait_pdu_until_us = esp_timer_get_time() + 3LL * 1000LL * 1000LL;
+            return;
+        }
         if (starts_with(line, "+CMTI:")) {
             enqueue_index(parse_cmti_index(line));
             return;
@@ -713,6 +732,7 @@ static void process_urc_line(const std::string& raw)
         if (line != "OK" && line != "ERROR") {
             idf_log_line("等待直推 PDU 时收到非 PDU 行，已关闭接收窗口");
             s_wait_pdu = false;
+            s_backfill_pending = true;  // 若这条其实是被截断的 PDU，兜底轮询还能救回存储中的副本
         }
         return;
     }
@@ -928,7 +948,7 @@ static void sms_task(void*)
     uint64_t last_poll_ms = 0;  // 64 位毫秒：32 位在 49.7 天回绕会重进启动提频窗口
     uint64_t start_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     uint32_t poll_count = 0;
-    uint8_t reassert_step = 0;  // 1=CMGF, 2=CNMI；拆帧避免一次堆多条 AT
+    uint8_t reassert_step = 0;  // 1=CMGF, 2=CPMS, 3=CNMI；拆帧避免一次堆多条 AT
     bool backfill_after_reassert = false;
     bool configured = false;
     bool first_backfill = true;
@@ -956,6 +976,11 @@ static void sms_task(void*)
                 if (reassert_step == 1) {
                     idf_modem_send_at("AT+CMGF=0", 1200, ignored);
                     reassert_step = 2;
+                } else if (reassert_step == 2) {
+                    // CPMS 也要重申：模组自发复位后存储会回落固件默认，
+                    // SM 容量为 0 的 eSIM 上接收会静默死亡(只 CMGF/CNMI 救不回来)
+                    idf_modem_reassert_sms_storage();
+                    reassert_step = 3;
                 } else {
                     idf_modem_send_at("AT+CNMI=2,1,0,0,0", 1200, ignored);
                     reassert_step = 0;
@@ -1041,6 +1066,67 @@ esp_err_t idf_sms_start(void)
     return ESP_OK;
 }
 
+// —— 长短信发送辅助 ——
+// 保守判定"纯 GSM7"：仅 ASCII 可打印字符与 \r\n。其余(含中文)按 UCS2 处理。
+// 保守的意义：切分假设 GSM7 但实际落入 UCS2 会导致该段超长编码失败，反之只是少装几个字
+static bool sms_text_basic_gsm7(const std::string& text)
+{
+    for (unsigned char c : text) {
+        if (c == '\r' || c == '\n') continue;
+        if (c < 0x20 || c >= 0x7F) return false;
+    }
+    return true;
+}
+
+// 按每段配额切分，不打断 UTF-8 字符。gsm7 按 septet 计(扩展表字符占 2)，
+// UCS2 按 UTF-16 码元计(BMP 外字符即代理对占 2)
+static std::vector<std::string> sms_split_parts(const std::string& text, bool gsm7, size_t per_part)
+{
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t units = 0;
+        size_t end = pos;
+        while (end < text.size()) {
+            unsigned char lead = static_cast<unsigned char>(text[end]);
+            size_t clen = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3 : (lead >= 0xC0) ? 2 : 1;
+            if (end + clen > text.size()) clen = text.size() - end;
+            size_t u;
+            if (gsm7) u = (clen == 1 && strchr("[]{}\\^~|", text[end])) ? 2 : 1;
+            else u = (clen == 4) ? 2 : 1;
+            if (units + u > per_part) break;
+            units += u;
+            end += clen;
+        }
+        if (end == pos) break;  // 防御：不应发生(单字符不会超过任何配额)
+        parts.push_back(text.substr(pos, end - pos));
+        pos = end;
+    }
+    return parts;
+}
+
+// 编码单个(或长短信某段)PDU；csms=0 表示普通单条
+static esp_err_t sms_encode_one(const std::string& phone, const std::string& body,
+                                uint16_t csms, uint8_t total, uint8_t part,
+                                std::string& sms_pdu, int& pdu_len, std::string& message)
+{
+    if (!s_pdu_mutex || xSemaphoreTake(s_pdu_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        message = "PDU 编码器忙";
+        return ESP_ERR_TIMEOUT;
+    }
+    s_pdu.setSCAnumber();
+    pdu_len = s_pdu.encodePDU(phone.c_str(), body.c_str(), csms, total, part);
+    if (pdu_len >= 0) sms_pdu.assign(s_pdu.getSMS(), strlen(s_pdu.getSMS()));
+    xSemaphoreGive(s_pdu_mutex);
+    if (pdu_len < 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "PDU 编码失败(%d)", pdu_len);
+        message = buf;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& text_raw, std::string& message)
 {
     message.clear();
@@ -1055,38 +1141,71 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
         message = "模组尚未注册网络";
         return ESP_ERR_INVALID_STATE;
     }
-    if (!s_pdu_mutex || xSemaphoreTake(s_pdu_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        message = "PDU 编码器忙";
-        return ESP_ERR_TIMEOUT;
-    }
-    s_pdu.setSCAnumber();
-    int pdu_len = s_pdu.encodePDU(phone.c_str(), text.c_str());
-    std::string sms_pdu;
-    if (pdu_len >= 0) sms_pdu.assign(s_pdu.getSMS(), strlen(s_pdu.getSMS()));
-    xSemaphoreGive(s_pdu_mutex);
 
-    if (pdu_len < 0) {
+    // 单条容量：GSM7 160 septet / UCS2 70 码元；超出则切分长短信。
+    // 分段配额扣除 7 字节 UDH(16 位参考号)：GSM7 152 septet / UCS2 66 码元
+    bool gsm7 = sms_text_basic_gsm7(text);
+    std::vector<std::string> parts = sms_split_parts(text, gsm7, gsm7 ? 160 : 70);
+    if (parts.empty()) {
+        message = "号码或内容无效";
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (parts.size() > 1) parts = sms_split_parts(text, gsm7, gsm7 ? 152 : 66);
+
+    uint16_t csms = 0;
+    if (parts.size() > 1) {
+        // 16 位参考号从熵源取初值后自增，0 保留为"非长短信"
+        static std::atomic<uint16_t> s_csms_ref{static_cast<uint16_t>(esp_timer_get_time() & 0x7FFF)};
+        csms = s_csms_ref.fetch_add(1, std::memory_order_relaxed);
+        if (csms == 0) csms = s_csms_ref.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    esp_err_t err = ESP_OK;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        std::string sms_pdu;
+        int pdu_len = -1;
+        // encodePDU 要求 csms/numparts/partnumber 三者同为 0(单条)或同非 0(分段)
+        err = sms_encode_one(phone, parts[i], csms,
+                             csms ? static_cast<uint8_t>(parts.size()) : 0,
+                             csms ? static_cast<uint8_t>(i + 1) : 0,
+                             sms_pdu, pdu_len, message);
+        if (err != ESP_OK) {
+            idf_sent_add(phone.c_str(), text.c_str(), false);
+            return err;
+        }
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "AT+CMGS=%d", pdu_len);
+        std::string resp;
+        err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), 20000, resp);
+        if (err != ESP_OK) {
+            if (parts.size() > 1) {
+                char buf[96];
+                snprintf(buf, sizeof(buf), "长短信第 %u/%u 段发送失败: %s",
+                         static_cast<unsigned>(i + 1), static_cast<unsigned>(parts.size()),
+                         resp.empty() ? esp_err_to_name(err) : trim(resp).c_str());
+                message = buf;
+            } else {
+                message = resp.empty() ? std::string(esp_err_to_name(err)) : trim(resp);
+            }
+            idf_sent_add(phone.c_str(), text.c_str(), false);
+            idf_logf("网页发送短信失败: %s", message.c_str());
+            return err;
+        }
+        // 分段之间稍作停顿，给模组喘息并让 URC 有机会被处理
+        if (i + 1 < parts.size()) vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    idf_sent_add(phone.c_str(), text.c_str(), true);
+    if (parts.size() > 1) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "PDU 编码失败(%d)", pdu_len);
+        snprintf(buf, sizeof(buf), "长短信发送成功(共 %u 段)", static_cast<unsigned>(parts.size()));
         message = buf;
-        idf_sent_add(phone.c_str(), text.c_str(), false);
-        return ESP_FAIL;
-    }
-
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "AT+CMGS=%d", pdu_len);
-    std::string resp;
-    esp_err_t err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), 20000, resp);
-    bool ok = (err == ESP_OK);
-    idf_sent_add(phone.c_str(), text.c_str(), ok);
-    if (ok) {
-        message = "短信发送成功";
-        idf_logf("网页发送短信成功: %s len=%u", phone.c_str(), static_cast<unsigned>(text.size()));
     } else {
-        message = resp.empty() ? std::string(esp_err_to_name(err)) : trim(resp);
-        idf_logf("网页发送短信失败: %s", message.c_str());
+        message = "短信发送成功";
     }
-    return err;
+    idf_logf("网页发送短信成功: %s len=%u parts=%u", phone.c_str(),
+             static_cast<unsigned>(text.size()), static_cast<unsigned>(parts.size()));
+    return ESP_OK;
 }
 
 esp_err_t idf_sms_enqueue_outgoing(const std::string& phone_raw, const std::string& text_raw, std::string& message)

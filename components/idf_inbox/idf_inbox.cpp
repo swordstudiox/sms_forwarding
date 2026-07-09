@@ -134,31 +134,40 @@ static void erase_sent_entry(uint32_t id)
     if (nvs_erase_key(s_sent_nvs, key) == ESP_OK) nvs_commit(s_sent_nvs);
 }
 
-// 遍历命名空间下所有 blob，逐个 get 出原始字节，回调解析。超上限的最旧项擦除交给调用方。
+// 遍历命名空间下所有 blob，逐个 get 出原始字节，回调解析(返回是否有效)。
+// 超上限的最旧项擦除交给调用方；解析失败/超长的坏 blob 在此就地回收——
+// 它们不在正常淘汰路径上，不清理会永久占用 smsdata 分区空间。
 template <typename Parse>
 static void for_each_blob(const char* ns, nvs_handle_t handle, Parse parse)
 {
+    std::vector<std::string> bad_keys;
     nvs_iterator_t it = nullptr;
     esp_err_t err = nvs_entry_find(SMS_NVS_PART, ns, NVS_TYPE_BLOB, &it);
     while (err == ESP_OK && it) {
         nvs_entry_info_t info;
         nvs_entry_info(it, &info);
         size_t len = 0;
+        bool valid = false;
         if (nvs_get_blob(handle, info.key, nullptr, &len) == ESP_OK && len > 0 && len < 2048) {
             std::vector<uint8_t> buf(len);
             if (nvs_get_blob(handle, info.key, buf.data(), &len) == ESP_OK) {
-                parse(buf.data(), len);
+                valid = parse(buf.data(), len);
             }
         }
+        if (!valid) bad_keys.push_back(info.key);
         err = nvs_entry_next(&it);
     }
     if (it) nvs_release_iterator(it);
+    if (!bad_keys.empty()) {
+        for (const auto& k : bad_keys) nvs_erase_key(handle, k.c_str());
+        nvs_commit(handle);
+    }
 }
 
 static void load_inbox_from_flash()
 {
     std::vector<IdfInboxEntry> items;
-    for_each_blob(NS_INBOX, s_inbox_nvs, [&](const uint8_t* p, size_t n) {
+    for_each_blob(NS_INBOX, s_inbox_nvs, [&](const uint8_t* p, size_t n) -> bool {
         BlobReader r{p, n};
         uint8_t ver = r.u8();
         bool forwarded = r.u8() != 0;
@@ -169,7 +178,9 @@ static void load_inbox_from_flash()
         e.ts = r.str(false);
         e.text = r.str(true);
         e.forwarded = forwarded;
-        if (ver == BLOB_VERSION && r.ok && e.id != 0) items.push_back(std::move(e));
+        if (ver != BLOB_VERSION || !r.ok || e.id == 0) return false;
+        items.push_back(std::move(e));
+        return true;
     });
     std::sort(items.begin(), items.end(),
               [](const IdfInboxEntry& a, const IdfInboxEntry& b) { return a.id < b.id; });
@@ -191,7 +202,7 @@ static void load_inbox_from_flash()
 static void load_sent_from_flash()
 {
     std::vector<IdfSentEntry> items;
-    for_each_blob(NS_SENT, s_sent_nvs, [&](const uint8_t* p, size_t n) {
+    for_each_blob(NS_SENT, s_sent_nvs, [&](const uint8_t* p, size_t n) -> bool {
         BlobReader r{p, n};
         uint8_t ver = r.u8();
         bool ok = r.u8() != 0;
@@ -201,7 +212,9 @@ static void load_sent_from_flash()
         e.target = r.str(false);
         e.text = r.str(true);
         e.ok = ok;
-        if (ver == BLOB_VERSION && r.ok && e.id != 0) items.push_back(std::move(e));
+        if (ver != BLOB_VERSION || !r.ok || e.id == 0) return false;
+        items.push_back(std::move(e));
+        return true;
     });
     std::sort(items.begin(), items.end(),
               [](const IdfSentEntry& a, const IdfSentEntry& b) { return a.id < b.id; });
@@ -336,25 +349,34 @@ uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts)
     return id;
 }
 
-void idf_inbox_mark_forwarded(uint32_t id)
+void idf_inbox_set_forwarded(uint32_t id, bool forwarded)
 {
     if (id == 0) return;
     ensure_init();
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return;
     for (size_t i = 0; i < s_inbox_filled; ++i) {
         if (s_inbox[i].id == id && !s_inbox[i].deleted) {
-            s_inbox[i].forwarded = true;
-            persist_inbox_entry(s_inbox[i]);  // 更新落盘的转发标记(重启后仍显示"已处理")
+            if (s_inbox[i].forwarded != forwarded) {
+                s_inbox[i].forwarded = forwarded;
+                persist_inbox_entry(s_inbox[i]);  // 更新落盘的转发标记(重启后仍显示"已处理")
+            }
             break;
         }
     }
     xSemaphoreGive(s_mutex);
 }
 
+void idf_inbox_mark_forwarded(uint32_t id)
+{
+    idf_inbox_set_forwarded(id, true);
+}
+
 size_t idf_inbox_count(void)
 {
+    // 读侧(本函数及以下各读取/JSON 接口)一律阻塞等锁：写侧最长持锁到两次
+    // nvs_commit 结束(数百 ms 级)。带超时的版本在该窗口内会把收件箱误报成"空"
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return 0;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return 0;
     size_t count = 0;
     for (size_t i = 0; i < s_inbox_filled; ++i) {
         if (!s_inbox[i].deleted) ++count;
@@ -366,7 +388,7 @@ size_t idf_inbox_count(void)
 bool idf_inbox_get_newest(size_t index, IdfInboxEntry& out)
 {
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
     size_t seen = 0;
     bool ok = false;
     for (size_t k = 0; k < s_inbox_filled; ++k) {
@@ -392,7 +414,7 @@ bool idf_inbox_get_by_id(uint32_t id, IdfInboxEntry& out)
 {
     if (id == 0) return false;
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
     bool ok = false;
     for (size_t i = 0; i < s_inbox_filled; ++i) {
         if (s_inbox[i].id == id && !s_inbox[i].deleted) {
@@ -414,7 +436,7 @@ bool idf_inbox_delete(uint32_t id)
 {
     if (id == 0) return false;
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
     bool ok = false;
     for (size_t i = 0; i < s_inbox_filled; ++i) {
         if (s_inbox[i].id == id && !s_inbox[i].deleted) {
@@ -454,7 +476,7 @@ void idf_sent_add(const char* target, const char* text, bool ok)
 size_t idf_sent_count(void)
 {
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return 0;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return 0;
     size_t count = s_sent_filled;
     xSemaphoreGive(s_mutex);
     return count;
@@ -463,7 +485,7 @@ size_t idf_sent_count(void)
 bool idf_sent_get_newest(size_t index, IdfSentEntry& out)
 {
     ensure_init();
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
     if (index >= s_sent_filled) {
         xSemaphoreGive(s_mutex);
         return false;
@@ -483,7 +505,7 @@ std::string idf_inbox_json(bool sent_box, int limit)
 
     std::string out;
     out += "[";
-    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
         out += "]";
         return out;
     }

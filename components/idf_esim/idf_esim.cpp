@@ -1,6 +1,7 @@
 #include "idf_esim.h"
 
 #include <algorithm>
+#include <atomic>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -431,7 +432,13 @@ public:
             char buf[96];
             snprintf(buf, sizeof(buf), "模组返回了不支持的逻辑通道 %d", m_channel);
             message = buf;
-            close();
+            // close() 只在 m_open 时生效，这里通道确实已被模组打开，必须直接关掉，
+            // 否则超范围通道会一直泄漏到卡上逻辑通道耗尽
+            char cchc[24];
+            snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", m_channel);
+            std::string ignored;
+            idf_modem_send_at(cchc, 5000, ignored);
+            m_channel = 0;
             return ESP_FAIL;
         }
         m_open = true;
@@ -668,15 +675,24 @@ static bool parse_profile_list_response(const Tlv& response,
     return true;
 }
 
-// EID 是 eUICC 的固定标识，读到一次后缓存：省掉每次列表前的一整个 APDU 会话。
-// 调用方由蜂窝任务互斥锁串行化，无并发写。
+// EID 是单张 eUICC 的固定标识，读到一次后缓存：省掉每次列表前的一整个 APDU 会话。
+// 调用方由蜂窝任务互斥锁串行化，无并发写。但可插拔 eUICC 热插拔换卡后 EID 会变，
+// 模组的卡身份钩子只置原子脏标记(可能在模组任务上下文触发)，真正清缓存在
+// 下次 read_eid(蜂窝任务上下文)执行，与读取方天然串行，无竞争。
 static std::string s_eid_cache;
+static std::atomic<bool> s_eid_cache_stale{false};
+
+static void on_sim_identity_changed()
+{
+    s_eid_cache_stale.store(true, std::memory_order_relaxed);
+}
 
 static esp_err_t read_eid(std::string& eid, std::string& message)
 {
     static constexpr uint8_t TAG_EID_RESP[] = {0xBF, 0x3E};
     static constexpr uint8_t TAG_EID[] = {0x5A};
 
+    if (s_eid_cache_stale.exchange(false, std::memory_order_relaxed)) s_eid_cache.clear();
     if (!s_eid_cache.empty()) {
         eid = s_eid_cache;
         message = "EID(缓存)";
@@ -795,10 +811,22 @@ static esp_err_t resolve_identifier(const std::string& raw,
         message = "无法解析别名/Profile 名称：" + list_msg;
         return err;
     }
+    const IdfEsimProfile* hit = nullptr;
+    int matched = 0;
     for (const IdfEsimProfile& profile : profiles) {
         if (!profile_matches(profile, raw)) continue;
-        return identifier_from_profile(profile, out, message) ? ESP_OK : ESP_FAIL;
+        ++matched;
+        if (!hit) hit = &profile;
     }
+    if (matched > 1) {
+        // 昵称/运营商名可能重复(如两张同一运营商的卡)。启停尤其是删除都不可逆，
+        // 绝不能"默默选第一个"，必须让用户改用唯一的完整 ICCID
+        char buf[96];
+        snprintf(buf, sizeof(buf), "该标识匹配到 %d 个 Profile，请改用完整 ICCID 指定", matched);
+        message = buf;
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (hit) return identifier_from_profile(*hit, out, message) ? ESP_OK : ESP_FAIL;
     message = "未找到匹配的 eSIM Profile: " + idf_esim_mask_profile_id(raw);
     return ESP_ERR_NOT_FOUND;
 }
@@ -1010,6 +1038,12 @@ static esp_err_t set_profile_nickname(const std::string& raw,
 }
 
 }  // namespace
+
+void idf_esim_init(void)
+{
+    // 必须定义在匿名命名空间之外，否则是内部链接，app_main 链接不到
+    idf_modem_set_sim_identity_hook(on_sim_identity_changed);
+}
 
 esp_err_t idf_esim_get_eid(std::string& eid, std::string& message)
 {

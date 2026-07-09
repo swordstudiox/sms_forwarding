@@ -437,9 +437,9 @@ esp_err_t idf_config_load(void)
         ESP_LOGW(TAG, "NVS 配置不存在，使用默认值");
         idf_log_line("NVS 配置不存在，使用默认值");
     } else if (err != ESP_OK) {
-        ESP_LOGE(TAG, "打开 NVS 配置失败: %s", esp_err_to_name(err));
-        idf_logf("打开 NVS 配置失败: %s", esp_err_to_name(err));
-        return err;
+        // 不提前返回：继续走默认值+编译期 WiFi 回退，至少保证设备能上网可救
+        ESP_LOGE(TAG, "打开 NVS 配置失败: %s，使用默认值", esp_err_to_name(err));
+        idf_logf("打开 NVS 配置失败: %s，使用默认值", esp_err_to_name(err));
     }
 
     if (err == ESP_OK) {
@@ -1043,9 +1043,16 @@ static esp_err_t commit_config_update(IdfConfig& next, const IdfConfig& base)
 
 esp_err_t idf_config_save(void)
 {
-    IdfConfig base = idf_config_get();
-    IdfConfig next = base;
-    return commit_config_update(next, base);
+    esp_err_t err = ensure_config_mutex();
+    if (err != ESP_OK) return err;
+    // 快照必须在 persist 锁内取：锁外快照到提交之间完成的单字段保存会被整体回写覆盖
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    IdfConfig next = idf_config_get();
+    normalize_config(next);
+    err = save_config_to_nvs(next);
+    if (err == ESP_OK) err = replace_config(next);
+    xSemaphoreGive(s_persist_mutex);
+    return err;
 }
 
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
@@ -1794,12 +1801,25 @@ int idf_config_enabled_push_count(void)
     return count;
 }
 
+// 常数时间比对：逐字节累积差异，不因首字节不匹配提前返回，避免计时侧信道
+static bool timing_safe_equals(const std::string& expected, const char* actual)
+{
+    size_t actual_len = strlen(actual);
+    unsigned char diff = (expected.size() == actual_len) ? 0 : 1;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        unsigned char b = actual_len ? static_cast<unsigned char>(actual[i % actual_len]) : 0;
+        diff |= static_cast<unsigned char>(expected[i]) ^ b;
+    }
+    return diff == 0;
+}
+
 bool idf_config_check_web_auth(const char* user, const char* pass)
 {
     if (!user || !pass) return false;
     if (ensure_config_mutex() != ESP_OK) return false;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    bool ok = (s_config.webUser == user) && (s_config.webPass == pass);
+    bool user_ok = timing_safe_equals(s_config.webUser, user);
+    bool pass_ok = timing_safe_equals(s_config.webPass, pass);
     xSemaphoreGive(s_config_mutex);
-    return ok;
+    return user_ok && pass_ok;
 }
