@@ -331,23 +331,15 @@ static const char* redact_secret(const std::string& value)
     return value.empty() ? "" : "__REDACTED__";
 }
 
-static const char* redact_custom_body(const std::string& value)
-{
-    return value.empty() ? "" : "__REDACTED__";
-}
-
-static std::string redact_push_url(const std::string& value)
-{
-    if (value.empty()) return {};
-    return "__REDACTED__";
-}
-
 static bool is_redacted_secret(const std::string& value)
 {
     return value == "__REDACTED__";
 }
 
-static std::string translate_rule_perl_classes(const std::string& pattern)
+// POSIX ERE 不认识 Perl 风格 \d \w \s；Arduino 版自研引擎支持这些转义，迁移前
+// 用户已存的转发规则依赖它们，先翻译成 POSIX 字符类再编译。
+// 保存时校验(本文件)与运行时匹配(idf_push)共用，保证两边语义一致。
+std::string idf_config_translate_perl_classes(const std::string& pattern)
 {
     std::string out;
     out.reserve(pattern.size() + 16);
@@ -405,7 +397,7 @@ esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::strin
         if (enabled == "0" || pat.empty() || type == "kw") continue;
         if (type != "from" && type != "re") continue;
 
-        std::string posix = translate_rule_perl_classes(pat);
+        std::string posix = idf_config_translate_perl_classes(pat);
         regex_t re = {};
         int rc = regcomp(&re, posix.c_str(), REG_EXTENDED | REG_ICASE | REG_NOSUB);
         if (rc != 0) {
@@ -603,7 +595,7 @@ std::string idf_config_export_text(bool full_export)
         snprintf(key, sizeof(key), "push%dtype", i);
         append_kv_i(out, key, ch.type);
         snprintf(key, sizeof(key), "push%durl", i);
-        append_kv(out, key, full_export ? ch.url : redact_push_url(ch.url));
+        append_kv(out, key, full_export ? ch.url : redact_secret(ch.url));
         snprintf(key, sizeof(key), "push%dname", i);
         append_kv(out, key, ch.name);
         snprintf(key, sizeof(key), "push%dk1", i);
@@ -611,7 +603,7 @@ std::string idf_config_export_text(bool full_export)
         snprintf(key, sizeof(key), "push%dk2", i);
         append_kv(out, key, full_export ? ch.key2 : redact_secret(ch.key2));
         snprintf(key, sizeof(key), "push%dbody", i);
-        append_kv(out, key, full_export ? ch.customBody : redact_custom_body(ch.customBody));
+        append_kv(out, key, full_export ? ch.customBody : redact_secret(ch.customBody));
     }
 
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {

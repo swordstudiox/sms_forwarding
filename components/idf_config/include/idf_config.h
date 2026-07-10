@@ -98,6 +98,8 @@ esp_err_t idf_config_save_email(bool enabled, const std::string& server, int por
 esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS]);
 esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::string& number_blacklist);
 esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::string* message);
+// 转发规则 Perl 风格 \d \w \s 转 POSIX 字符类；保存时校验与运行时匹配共用
+std::string idf_config_translate_perl_classes(const std::string& pattern);
 esp_err_t idf_config_save_forward_rules(const std::string& rules);
 esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t action,
                                     const std::string& target, const std::string& url,

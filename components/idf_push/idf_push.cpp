@@ -629,48 +629,10 @@ static bool channel_valid(const IdfPushChannel& ch)
     return true;
 }
 
-// POSIX ERE 不认识 Perl 风格 \d \w \s；Arduino 版自研引擎支持这些转义，
-// 迁移前用户已存的转发规则依赖它们，这里先翻译成 POSIX 字符类再编译。
-static std::string translate_perl_classes(const std::string& pattern)
-{
-    std::string out;
-    out.reserve(pattern.size() + 16);
-    bool in_bracket = false;
-    for (size_t i = 0; i < pattern.size(); ++i) {
-        char ch = pattern[i];
-        if (ch == '[' && !in_bracket) { in_bracket = true; out += ch; continue; }
-        if (ch == ']' && in_bracket) { in_bracket = false; out += ch; continue; }
-        if (ch != '\\' || i + 1 >= pattern.size()) { out += ch; continue; }
-        char next = pattern[i + 1];
-        const char* body = nullptr;   // 字符类内部内容
-        const char* neg = nullptr;    // 取反形式(仅括号外可表达)
-        switch (next) {
-            case 'd': body = "0-9"; break;
-            case 'D': neg = "0-9"; break;
-            case 'w': body = "A-Za-z0-9_"; break;
-            case 'W': neg = "A-Za-z0-9_"; break;
-            case 's': body = " \t\r\n\f\v"; break;
-            case 'S': neg = " \t\r\n\f\v"; break;
-            default: out += ch; out += next; ++i; continue;
-        }
-        if (in_bracket) {
-            // 括号内只能展开正类；取反形式无法表达，原样保留
-            if (body) { out += body; ++i; }
-            else { out += ch; out += next; ++i; }
-        } else {
-            out += '[';
-            if (neg) { out += '^'; out += neg; }
-            else out += body;
-            out += ']';
-            ++i;
-        }
-    }
-    return out;
-}
-
 static bool regex_search_case_insensitive(const std::string& pattern, const std::string& text)
 {
-    std::string posix = translate_perl_classes(pattern);
+    // Perl 风格 \d \w \s 转 POSIX 字符类；翻译逻辑与保存时校验共用(idf_config)
+    std::string posix = idf_config_translate_perl_classes(pattern);
     regex_t re = {};
     if (regcomp(&re, posix.c_str(), REG_EXTENDED | REG_ICASE | REG_NOSUB) != 0) return false;
     bool hit = regexec(&re, text.c_str(), 0, nullptr, 0) == 0;

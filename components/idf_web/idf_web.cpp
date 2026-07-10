@@ -208,11 +208,23 @@ static bool is_ap_open_uri(const char* uri)
     return false;
 }
 
-// 跨站 POST 防护：浏览器发起的跨站表单/fetch 必带 Origin，与 Host 不一致即拒绝。
-// 变更类操作均已强制 POST，GET 一律放行；curl/脚本不带 Origin 不受影响。
+// 跨站 POST 防护，按可信度分层：
+// 1. 带 X-SMS-CSRF 自定义头直接放行——跨站页面无法附带自定义头(会触发本服务不响应
+//    的 CORS 预检)，能带上的必是本站前端或用户自己的脚本；也救活反代改写 Host 的部署。
+// 2. Sec-Fetch-Site 为 cross-site 一律拒绝：现代浏览器所有请求都带该头，可补
+//    个别隐私插件剥离 Origin 造成的盲区。
+// 3. Origin 与 Host 不一致拒绝。变更类操作均已强制 POST，GET 一律放行；
+//    curl/脚本不带 Origin 与 Sec-Fetch-Site，不受影响。
 static bool origin_allowed(httpd_req_t* req)
 {
     if (req->method != HTTP_POST) return true;
+    char csrf[8] = {};
+    if (httpd_req_get_hdr_value_str(req, "X-SMS-CSRF", csrf, sizeof(csrf)) == ESP_OK) return true;
+    char sfs[24] = {};
+    if (httpd_req_get_hdr_value_str(req, "Sec-Fetch-Site", sfs, sizeof(sfs)) == ESP_OK &&
+        strcasecmp(sfs, "cross-site") == 0) {
+        return false;
+    }
     char origin[160] = {};
     if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) != ESP_OK) return true;
     if (strcmp(origin, "null") == 0) return false;  // 沙箱 iframe 等匿名来源
@@ -257,13 +269,11 @@ static bool check_auth(httpd_req_t* req)
     return false;
 }
 
+// 写接口的跨站兜底：复用 origin_allowed 的分层判定(自定义头/Sec-Fetch-Site/Origin)，
+// 返回 JSON 错误。check_auth 已前置同一校验，这里防的是未来重构改动调用顺序。
 static bool check_csrf(httpd_req_t* req)
 {
-    char token[16] = {};
-    if (httpd_req_get_hdr_value_str(req, "X-SMS-CSRF", token, sizeof(token)) == ESP_OK &&
-        strcmp(token, "1") == 0) {
-        return true;
-    }
+    if (origin_allowed(req)) return true;
     set_json_no_cache(req);
     httpd_resp_set_status(req, "403 Forbidden");
     httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"跨站写入校验失败，请刷新页面后重试\"}");
