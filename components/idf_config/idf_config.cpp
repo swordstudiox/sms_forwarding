@@ -705,51 +705,90 @@ std::string idf_config_export_text(bool full_export)
     return out;
 }
 
-static void apply_import_key(IdfConfig& c, const std::string& key, const std::string& value)
+static bool parse_wifi_network_key(const std::string& key, int& idx, std::string& suffix)
+{
+    if (key.rfind("wifi", 0) != 0 || key.size() <= 8 ||
+        !isdigit(static_cast<unsigned char>(key[4]))) {
+        return false;
+    }
+    size_t pos = 4;
+    idx = 0;
+    while (pos < key.size() && isdigit(static_cast<unsigned char>(key[pos]))) {
+        idx = idx * 10 + (key[pos] - '0');
+        ++pos;
+    }
+    if (idx < 0 || idx >= IDF_MAX_WIFI_NETWORKS) return false;
+    suffix = key.substr(pos);
+    return true;
+}
+
+static std::string preserved_wifi_pass_for_import(const IdfConfig& base, const IdfConfig& next, int idx)
+{
+    if (idx < 0 || idx >= IDF_MAX_WIFI_NETWORKS) return {};
+    const std::string& ssid = next.wifiNetworks[idx].ssid;
+    if (!ssid.empty()) {
+        for (int i = 0; i < base.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            if (base.wifiNetworks[i].ssid == ssid) return base.wifiNetworks[i].pass;
+        }
+    }
+    if (idx < base.wifiNetworkCount && idx < IDF_MAX_WIFI_NETWORKS) {
+        return base.wifiNetworks[idx].pass;
+    }
+    return {};
+}
+
+static void apply_import_key(IdfConfig& c, const IdfConfig& base,
+                             const std::string& key, const std::string& value)
 {
     if (key == "wifiSsid") {
         c.wifiSsid = value;
         c.wifiNetworks[0].ssid = value;
         if (c.wifiNetworkCount < 1) c.wifiNetworkCount = 1;
+        return;
     }
-    else if (key == "wifiPass" && !is_redacted_secret(value)) {
+    if (key == "wifiPass" && !is_redacted_secret(value)) {
         c.wifiPass = value;
         c.wifiNetworks[0].pass = value;
         if (c.wifiNetworkCount < 1) c.wifiNetworkCount = 1;
+        return;
     }
-    else if (key == "wifiSsid2") {
+    if (key == "wifiSsid2") {
         c.wifiSsid2 = value;
         c.wifiNetworks[1].ssid = value;
         if (c.wifiNetworkCount < 2) c.wifiNetworkCount = 2;
+        return;
     }
-    else if (key == "wifiPass2" && !is_redacted_secret(value)) {
+    if (key == "wifiPass2" && !is_redacted_secret(value)) {
         c.wifiPass2 = value;
         c.wifiNetworks[1].pass = value;
         if (c.wifiNetworkCount < 2) c.wifiNetworkCount = 2;
+        return;
     }
-    else if (key == "wifiCount") {
+    if (key == "wifiCount") {
         int count = 0;
         import_int_field(count, value);
         count = clamp_int(count, 0, IDF_MAX_WIFI_NETWORKS);
         for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) c.wifiNetworks[i] = {};
-        c.wifiNetworkCount = static_cast<uint8_t>(count);
-    }
-    else if (key.rfind("wifi", 0) == 0 && key.size() > 8 && isdigit(static_cast<unsigned char>(key[4]))) {
-        size_t pos = 4;
-        int idx = 0;
-        while (pos < key.size() && isdigit(static_cast<unsigned char>(key[pos]))) {
-            idx = idx * 10 + (key[pos] - '0');
-            ++pos;
+        for (int i = 0; i < count && i < base.wifiNetworkCount; ++i) {
+            c.wifiNetworks[i].pass = base.wifiNetworks[i].pass;
         }
-        if (idx < 0 || idx >= IDF_MAX_WIFI_NETWORKS) return;
-        std::string suffix = key.substr(pos);
+        c.wifiNetworkCount = static_cast<uint8_t>(count);
+        return;
+    }
+    int idx = 0;
+    std::string suffix;
+    if (parse_wifi_network_key(key, idx, suffix)) {
         IdfWifiNetwork& net = c.wifiNetworks[idx];
         if (suffix == "Ssid") net.ssid = value;
-        else if (suffix == "Pass" && !is_redacted_secret(value)) net.pass = value;
-        else return;
+        else if (suffix == "Pass") {
+            net.pass = is_redacted_secret(value) ? preserved_wifi_pass_for_import(base, c, idx) : value;
+        } else {
+            return;
+        }
         if (c.wifiNetworkCount <= idx) c.wifiNetworkCount = static_cast<uint8_t>(idx + 1);
+        return;
     }
-    else if (key == "smtpServer") c.smtpServer = value;
+    if (key == "smtpServer") c.smtpServer = value;
     else if (key == "smtpPort") import_int_field(c.smtpPort, value);
     else if (key == "smtpUser") c.smtpUser = value;
     else if (key == "smtpPass" && !is_redacted_secret(value)) c.smtpPass = value;
@@ -838,7 +877,7 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
             size_t keep = key.find_last_not_of(" \t\r\n");
             if (keep != std::string::npos) key.erase(keep + 1);
             if (!key.empty()) {
-                apply_import_key(next, key, value);
+                apply_import_key(next, base, key, value);
                 ++applied;
             }
         }

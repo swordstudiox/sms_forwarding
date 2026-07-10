@@ -1054,6 +1054,8 @@ static esp_err_t connect_sta_begin(const StaCredential& cred, bool disconnect_fi
     return ESP_OK;
 }
 
+static bool sta_wait_connect_result(const StaCredential& cred);
+
 static void scan_reconnect_task(void* arg)
 {
     (void)arg;
@@ -1066,16 +1068,25 @@ static void scan_reconnect_task(void* arg)
 
     std::vector<StaCredential> candidates = s_sta_candidates;
     std::vector<StaCredential> ordered = ordered_candidates_by_scan(candidates);
-    if (!ordered.empty()) {
-        const StaCredential cred = ordered.front();
+    bool started = false;
+    for (const StaCredential& cred : ordered) {
         idf_logf("WiFi 离线超过30秒，扫描后重连已知网络: %s", cred.ssid.c_str());
-        esp_err_t err = connect_sta_begin(cred, true);
+        esp_err_t err = connect_sta_begin(cred, started);
         if (err == ESP_OK) {
+            started = true;
             s_offline_since_us.store(esp_timer_get_time(), std::memory_order_relaxed);
+            if (sta_wait_connect_result(cred)) {
+                s_failover_task_running.store(false, std::memory_order_relaxed);
+                vTaskDelete(nullptr);
+                return;
+            }
+            if (!sta_failover_still_needed()) break;
+            idf_log_line("运行时扫描重连尝试下一组已知 WiFi");
         } else {
             idf_logf("扫描重连 WiFi 失败: %s", esp_err_to_name(err));
         }
-    } else {
+    }
+    if (ordered.empty()) {
         idf_log_line("WiFi 离线超过30秒，但没有已知网络可重连");
     }
 
