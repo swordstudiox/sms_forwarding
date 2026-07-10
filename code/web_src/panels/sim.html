@@ -51,17 +51,12 @@
         </div>
         <div class="sim-stack">
         <div class="card">
-          <div class="card-header">WiFi 网络<button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
+          <div class="card-header">已知 WiFi 网络<button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
           <div class="card-body">
-            <div class="form-group"><label class="form-label">选择网络</label><select class="form-select" id="wifiScanSel" onchange="wifiPick()"><option value="">点“扫描”获取周边 WiFi</option></select></div>
-            <div class="form-grid two">
-              <div class="form-group"><label class="form-label">WiFi 1 名称 (SSID)</label><input class="form-input" type="text" id="wifiSsidIn" onfocus="wifiSetPickTarget(1)" placeholder="优先连接"></div>
-              <div class="form-group"><label class="form-label">WiFi 1 密码</label><input class="form-input" type="password" id="wifiPassIn" placeholder="留空=保留旧密码"><label class="form-label" style="margin-top:6px;font-weight:500;"><input type="checkbox" id="wifiClearPassIn"> 清空已保存密码（开放网络）</label></div>
-              <div class="form-group"><label class="form-label">WiFi 2 名称 (SSID)</label><input class="form-input" type="text" id="wifiSsid2In" onfocus="wifiSetPickTarget(2)" placeholder="WiFi 1 失败后尝试"></div>
-              <div class="form-group"><label class="form-label">WiFi 2 密码</label><input class="form-input" type="password" id="wifiPass2In" placeholder="留空=保留旧密码"><label class="form-label" style="margin-top:6px;font-weight:500;"><input type="checkbox" id="wifiClearPass2In"> 清空已保存密码（开放网络）</label></div>
-            </div>
-            <div class="btn-row"><button class="btn btn-primary" onclick="wifiSave()">保存并重启接入</button><button class="btn btn-secondary" onclick="wifiRestart()">重连当前网络</button></div>
-            <p class="form-hint">保存后设备重启，先尝试 WiFi 1，失败后尝试 WiFi 2；全部失败才会自动重开配网热点</p>
+            <div class="form-group"><label class="form-label">扫描结果</label><select class="form-select" id="wifiScanSel" onchange="wifiPick()"><option value="">点“扫描”获取周边 WiFi</option></select></div>
+            <div id="wifiListHost"></div>
+            <div class="btn-row"><button class="btn btn-secondary" onclick="wifiAdd()">添加网络</button><button class="btn btn-primary" onclick="wifiSave()">保存并重启接入</button><button class="btn btn-secondary" onclick="wifiRestart()">扫描重连</button></div>
+            <p class="form-hint">设备启动和重连时会扫描当前环境，优先连接信号最好的已知网络；开机 60 秒仍连不上会开启 10 分钟临时配网热点，运行中掉线不会自动开放热点。</p>
             <div class="result-box" id="wifiCfgResult"></div>
             <div class="result-box" id="wifiResult"></div>
           </div>

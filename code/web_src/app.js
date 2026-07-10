@@ -1604,10 +1604,8 @@
     }
 
     // ---- WiFi settings ----
-    var wifiPickTarget = 1;
-    function wifiSetPickTarget(slot) {
-      wifiPickTarget = slot === 2 ? 2 : 1;
-    }
+    var wifiNetworks = [];
+    var WIFI_MAX_NETWORKS = 5;
     function setWifiScanMessage(text) {
       var sel = document.getElementById('wifiScanSel');
       if (!sel) return;
@@ -1637,43 +1635,140 @@
     function wifiPick() {
       var v = document.getElementById('wifiScanSel').value;
       if (!v) return;
-      var ssidIn = document.getElementById(wifiPickTarget === 2 ? 'wifiSsid2In' : 'wifiSsidIn');
-      var passIn = document.getElementById(wifiPickTarget === 2 ? 'wifiPass2In' : 'wifiPassIn');
-      if (ssidIn) ssidIn.value = v;
+      var idx = wifiNetworks.findIndex(function(n){ return n.ssid === v; });
+      if (idx < 0) idx = wifiAdd({ssid:v, passSet:false});
+      var passIn = document.getElementById('wifiPass' + idx);
       if (passIn) passIn.focus();
     }
+    function wifiSyncFromDom() {
+      var next = [];
+      for (var i = 0; i < wifiNetworks.length && i < WIFI_MAX_NETWORKS; i++) {
+        var ssid = document.getElementById('wifiSsid' + i);
+        var pass = document.getElementById('wifiPass' + i);
+        var clear = document.getElementById('wifiClearPass' + i);
+        next.push({
+          ssid: ssid ? ssid.value.trim() : '',
+          pass: pass ? pass.value : '',
+          passSet: !!(wifiNetworks[i] && wifiNetworks[i].passSet),
+          clearPass: !!(clear && clear.checked)
+        });
+      }
+      wifiNetworks = next.filter(function(n){ return !!n.ssid; });
+    }
+    function wifiRenderList() {
+      var host = document.getElementById('wifiListHost');
+      if (!host) return;
+      host.replaceChildren();
+      if (!wifiNetworks.length) {
+        var empty = document.createElement('p');
+        empty.className = 'form-hint';
+        empty.textContent = '尚未保存已知 WiFi，可扫描或手动添加。';
+        host.appendChild(empty);
+      }
+      wifiNetworks.slice(0, WIFI_MAX_NETWORKS).forEach(function(net, idx) {
+        var box = document.createElement('div');
+        box.className = 'form-grid two';
+        box.style.marginBottom = '10px';
+
+        var ssidGroup = document.createElement('div');
+        ssidGroup.className = 'form-group';
+        var ssidLabel = document.createElement('label');
+        ssidLabel.className = 'form-label';
+        ssidLabel.textContent = '网络 ' + (idx + 1) + ' 名称 (SSID)';
+        var ssidInput = document.createElement('input');
+        ssidInput.className = 'form-input';
+        ssidInput.type = 'text';
+        ssidInput.id = 'wifiSsid' + idx;
+        ssidInput.value = net.ssid || '';
+        ssidGroup.appendChild(ssidLabel);
+        ssidGroup.appendChild(ssidInput);
+
+        var passGroup = document.createElement('div');
+        passGroup.className = 'form-group';
+        var passLabel = document.createElement('label');
+        passLabel.className = 'form-label';
+        passLabel.textContent = '网络 ' + (idx + 1) + ' 密码';
+        var passInput = document.createElement('input');
+        passInput.className = 'form-input';
+        passInput.type = 'password';
+        passInput.id = 'wifiPass' + idx;
+        passInput.placeholder = net.passSet ? '留空=保留旧密码' : '开放网络可留空';
+        var clearLabel = document.createElement('label');
+        clearLabel.className = 'form-label';
+        clearLabel.style.marginTop = '6px';
+        clearLabel.style.fontWeight = '500';
+        var clearInput = document.createElement('input');
+        clearInput.type = 'checkbox';
+        clearInput.id = 'wifiClearPass' + idx;
+        clearLabel.appendChild(clearInput);
+        clearLabel.appendChild(document.createTextNode(' 清空已保存密码（开放网络）'));
+        var remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'btn btn-secondary btn-sm';
+        remove.textContent = '删除';
+        remove.onclick = function(){ wifiRemove(idx); };
+        remove.style.marginTop = '8px';
+        passGroup.appendChild(passLabel);
+        passGroup.appendChild(passInput);
+        passGroup.appendChild(clearLabel);
+        passGroup.appendChild(remove);
+
+        box.appendChild(ssidGroup);
+        box.appendChild(passGroup);
+        host.appendChild(box);
+      });
+    }
+    function wifiAdd(net) {
+      wifiSyncFromDom();
+      if (wifiNetworks.length >= WIFI_MAX_NETWORKS) {
+        alert('最多保存 ' + WIFI_MAX_NETWORKS + ' 个 WiFi 网络');
+        return WIFI_MAX_NETWORKS - 1;
+      }
+      wifiNetworks.push(net || {ssid:'', passSet:false});
+      wifiRenderList();
+      return wifiNetworks.length - 1;
+    }
+    function wifiRemove(idx) {
+      wifiSyncFromDom();
+      wifiNetworks.splice(idx, 1);
+      wifiRenderList();
+    }
     function wifiSave() {
-      var s = document.getElementById('wifiSsidIn').value.trim();
-      var s2 = document.getElementById('wifiSsid2In').value.trim();
-      if (!s && !s2) { alert('请至少输入一组 WiFi 名称'); return; }
-      var names = s && s2 ? (s + ' / ' + s2) : (s || s2);
+      wifiSyncFromDom();
+      if (!wifiNetworks.length) { alert('请至少输入一个 WiFi 名称'); return; }
+      var names = wifiNetworks.map(function(n){ return n.ssid; }).join(' / ');
       if (!confirm('保存并重启接入 “' + names + '”？设备将重启约 15-20 秒。')) return;
       var r = document.getElementById('wifiCfgResult');
       r.className = 'result-box result-loading'; r.textContent = '保存中，设备即将重启...';
-      var clear1 = document.getElementById('wifiClearPassIn');
-      var clear2 = document.getElementById('wifiClearPass2In');
-      var body = 'ssid=' + encodeURIComponent(s) +
-                 '&pass=' + encodeURIComponent(document.getElementById('wifiPassIn').value) +
-                 '&ssid2=' + encodeURIComponent(s2) +
-                 '&pass2=' + encodeURIComponent(document.getElementById('wifiPass2In').value);
-      if (clear1 && clear1.checked) body += '&clearPass=1';
-      if (clear2 && clear2.checked) body += '&clearPass2=1';
-      csrfFetch('/wificonfig', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body}).then(jsonOrThrow).then(function(d) {
+      var body = new URLSearchParams();
+      body.append('wifiCount', String(wifiNetworks.length));
+      wifiNetworks.forEach(function(n, i) {
+        body.append('wifi' + i + 'Ssid', n.ssid);
+        body.append('wifi' + i + 'Pass', n.pass || '');
+        if (n.clearPass) body.append('wifi' + i + 'ClearPass', '1');
+      });
+      csrfFetch('/wificonfig', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body.toString()}).then(jsonOrThrow).then(function(d) {
         r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
       }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请连接目标 WiFi 后重新访问设备'; });
     }
     function wifiPrefill() {
       var hasConfiguredWifi = false;
       ensureConfig(false).then(function(cfg) {
-        var ssidIn = document.getElementById('wifiSsidIn');
-        var ssid2In = document.getElementById('wifiSsid2In');
-        hasConfiguredWifi = !!(cfg.wifiSsid || cfg.wifiSsid2);
-        if (ssidIn && cfg.wifiSsid && !ssidIn.value) ssidIn.value = cfg.wifiSsid;
-        if (ssid2In && cfg.wifiSsid2 && !ssid2In.value) ssid2In.value = cfg.wifiSsid2;
+        wifiNetworks = Array.isArray(cfg.wifiNetworks) ? cfg.wifiNetworks.map(function(n){
+          return {ssid:n.ssid || '', passSet:!!n.passSet, fallback:!!n.fallback};
+        }).filter(function(n){ return !!n.ssid; }) : [];
+        if (!wifiNetworks.length) {
+          if (cfg.wifiSsid) wifiNetworks.push({ssid:cfg.wifiSsid, passSet:true});
+          if (cfg.wifiSsid2 && cfg.wifiSsid2 !== cfg.wifiSsid) wifiNetworks.push({ssid:cfg.wifiSsid2, passSet:true});
+        }
+        hasConfiguredWifi = !!wifiNetworks.length;
+        wifiRenderList();
       }).catch(function(){});
       fetch('/status?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
-        var ssidIn = document.getElementById('wifiSsidIn');
-        if (ssidIn && d.ssid && !d.apMode && !ssidIn.value && !hasConfiguredWifi) ssidIn.value = d.ssid;
+        if (d.ssid && !d.apMode && !hasConfiguredWifi) {
+          wifiNetworks = [{ssid:d.ssid, passSet:false}];
+          wifiRenderList();
+        }
       }).catch(function(){});
     }
 

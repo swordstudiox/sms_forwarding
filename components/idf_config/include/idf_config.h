@@ -9,6 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
+static constexpr int IDF_MAX_WIFI_NETWORKS = 5;
 static constexpr const char* IDF_FW_VERSION = "1.0.8-fork.1";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
@@ -39,7 +40,17 @@ struct IdfPushChannel {
     std::string customBody;
 };
 
+struct IdfWifiNetwork {
+    std::string ssid;
+    std::string pass;
+    bool fallback = false;
+};
+
 struct IdfConfig {
+    IdfWifiNetwork wifiNetworks[IDF_MAX_WIFI_NETWORKS];
+    uint8_t wifiNetworkCount = 0;
+
+    // 旧字段作为兼容镜像保留：读取旧 NVS、导入旧备份、回退旧固件时都能工作。
     std::string wifiSsid;
     std::string wifiPass;
     std::string wifiSsid2;
@@ -95,6 +106,10 @@ esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
                                const std::string& ssid2, const std::string& pass2,
                                bool preserve_blank_pass, bool preserve_blank_pass2,
                                bool clear_pass, bool clear_pass2);
+esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                        int count,
+                                        const bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS],
+                                        const bool clear_passes[IDF_MAX_WIFI_NETWORKS]);
 esp_err_t idf_config_save_account(const std::string& user, const std::string& pass);
 esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server);
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
@@ -136,6 +151,8 @@ struct IdfConfigStatusView {
 
 // /config.json 专用快照：不带定时任务数组，避免面板切换/保存后刷新时全量深拷贝
 struct IdfConfigWebView {
+    IdfWifiNetwork wifiNetworks[IDF_MAX_WIFI_NETWORKS];
+    uint8_t wifiNetworkCount = 0;
     std::string wifiSsid;
     std::string wifiSsid2;
     std::string webUser = IDF_DEFAULT_WEB_USER;
