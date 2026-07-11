@@ -147,6 +147,26 @@ static void limit_utf8_bytes(std::string& value, size_t max_len)
     value.resize(end);
 }
 
+static void sanitize_mdns_host(std::string& host)
+{
+    std::string out;
+    out.reserve(host.size());
+    for (char ch : host) {
+        unsigned char c = static_cast<unsigned char>(ch);
+        if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+            out.push_back(static_cast<char>(c));
+        } else if (c == '.') {
+            break;  // 用户输入 sms.local 时只保留 sms
+        }
+    }
+    while (!out.empty() && out.front() == '-') out.erase(out.begin());
+    while (!out.empty() && out.back() == '-') out.pop_back();
+    if (out.empty()) out = "sms";
+    if (out.size() > 32) out.resize(32);
+    host = out;
+}
+
 static void sync_wifi_compat_from_list(IdfConfig& c)
 {
     c.wifiSsid.clear();
@@ -216,6 +236,7 @@ static void normalize_config(IdfConfig& c)
 
     c.tzOffsetMin = clamp_int(c.tzOffsetMin, -720, 840);
     limit_utf8_bytes(c.ntpServer, 128);
+    sanitize_mdns_host(c.mdnsHost);
     c.rebootHour = clamp_int(c.rebootHour, 0, 23);
     c.hbHour = clamp_int(c.hbHour, 0, 23);
 
@@ -390,7 +411,7 @@ static bool is_redacted_secret(const std::string& value)
     return value == "__REDACTED__";
 }
 
-static std::string translate_rule_perl_classes(const std::string& pattern)
+std::string idf_config_translate_perl_classes(const std::string& pattern)
 {
     std::string out;
     out.reserve(pattern.size() + 16);
@@ -448,7 +469,7 @@ esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::strin
         if (enabled == "0" || pat.empty() || type == "kw") continue;
         if (type != "from" && type != "re") continue;
 
-        std::string posix = translate_rule_perl_classes(pat);
+        std::string posix = idf_config_translate_perl_classes(pat);
         regex_t re = {};
         int rc = regcomp(&re, posix.c_str(), REG_EXTENDED | REG_ICASE | REG_NOSUB);
         if (rc != 0) {
@@ -524,6 +545,7 @@ esp_err_t idf_config_load(void)
 
         next.tzOffsetMin = read_i32(nvs, "tzMin", 480);
         next.ntpServer = read_str(nvs, "ntpSrv", "ntp.aliyun.com", 128);
+        next.mdnsHost = read_str(nvs, "mdnsHost", "sms", 32);
         next.rebootEnabled = read_bool(nvs, "rbEn", false);
         next.rebootHour = read_i32(nvs, "rbHour", 4);
         next.hbEnabled = read_bool(nvs, "hbEn", false);
@@ -640,6 +662,7 @@ std::string idf_config_export_text(bool full_export)
 
     append_kv_i(out, "tzOffsetMin", c.tzOffsetMin);
     append_kv(out, "ntpServer", c.ntpServer);
+    append_kv(out, "mdnsHost", c.mdnsHost);
     append_kv_i(out, "rebootEnabled", c.rebootEnabled ? 1 : 0);
     append_kv_i(out, "rebootHour", c.rebootHour);
     append_kv_i(out, "hbEnabled", c.hbEnabled ? 1 : 0);
@@ -802,6 +825,7 @@ static void apply_import_key(IdfConfig& c, const IdfConfig& base,
     else if (key == "pushEnabled") c.pushEnabled = bool_from_text(value);
     else if (key == "tzOffsetMin") import_int_field(c.tzOffsetMin, value);
     else if (key == "ntpServer") c.ntpServer = value;
+    else if (key == "mdnsHost") c.mdnsHost = value;
     else if (key == "rebootEnabled") c.rebootEnabled = bool_from_text(value);
     else if (key == "rebootHour") import_int_field(c.rebootHour, value);
     else if (key == "hbEnabled") c.hbEnabled = bool_from_text(value);
@@ -1073,6 +1097,7 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
 
     if (err == ESP_OK) err = nvs_set_i32(nvs, "tzMin", c.tzOffsetMin);
     if (err == ESP_OK) err = write_str(nvs, "ntpSrv", c.ntpServer);
+    if (err == ESP_OK) err = write_str(nvs, "mdnsHost", c.mdnsHost);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "rbEn", c.rebootEnabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_i32(nvs, "rbHour", c.rebootHour);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "hbEn", c.hbEnabled ? 1 : 0);
@@ -1270,6 +1295,31 @@ esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
     return idf_config_save_wifi_networks(networks, 2, preserve, clear);
 }
 
+esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass)
+{
+    if (ssid.empty() || ssid.size() >= 32 || pass.size() >= 64) return ESP_ERR_INVALID_ARG;
+    IdfConfig base = idf_config_get();
+    if (base.wifiNetworkCount > 0 &&
+        base.wifiNetworks[0].ssid == ssid &&
+        base.wifiNetworks[0].pass == pass) {
+        return ESP_OK;
+    }
+
+    IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS];
+    bool preserve[IDF_MAX_WIFI_NETWORKS] = {};
+    bool clear[IDF_MAX_WIFI_NETWORKS] = {};
+    networks[0].ssid = ssid;
+    networks[0].pass = pass;
+    int count = 1;
+    for (int i = 0; i < base.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS && count < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (base.wifiNetworks[i].ssid.empty() || base.wifiNetworks[i].ssid == ssid) continue;
+        networks[count] = base.wifiNetworks[i];
+        preserve[count] = true;
+        ++count;
+    }
+    return idf_config_save_wifi_networks(networks, count, preserve, clear);
+}
+
 esp_err_t idf_config_save_account(const std::string& user, const std::string& pass)
 {
     esp_err_t mutex_err = ensure_config_mutex();
@@ -1321,6 +1371,25 @@ esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server)
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
         s_config.tzOffsetMin = next_tz;
         s_config.ntpServer = next_ntp;
+        xSemaphoreGive(s_config_mutex);
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
+esp_err_t idf_config_save_mdns_host(const std::string& host)
+{
+    std::string next_host = host;
+    sanitize_mdns_host(next_host);
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = begin_field_save(&nvs);
+    if (err != ESP_OK) return err;
+    err = write_str(nvs, "mdnsHost", next_host);
+    err = commit_field_save(nvs, err, "mDNS 主机名");
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.mdnsHost = next_host;
         xSemaphoreGive(s_config_mutex);
     }
     xSemaphoreGive(s_persist_mutex);
@@ -1709,6 +1778,7 @@ IdfConfigWebView idf_config_get_web_view(void)
     view.emailEnabled = s_config.emailEnabled;
     view.pushEnabled = s_config.pushEnabled;
     view.ntpServer = s_config.ntpServer;
+    view.mdnsHost = s_config.mdnsHost;
     view.tzOffsetMin = s_config.tzOffsetMin;
     view.rebootEnabled = s_config.rebootEnabled;
     view.rebootHour = s_config.rebootHour;
@@ -1941,6 +2011,41 @@ std::string idf_config_get_ntp_server(void)
     std::string server = s_config.ntpServer;
     xSemaphoreGive(s_config_mutex);
     return server;
+}
+
+void idf_config_copy_mdns_host(char* out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (ensure_config_mutex() != ESP_OK) {
+        snprintf(out, cap, "sms");
+        return;
+    }
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    snprintf(out, cap, "%s", s_config.mdnsHost.c_str());
+    xSemaphoreGive(s_config_mutex);
+}
+
+std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void)
+{
+    std::vector<IdfWifiNetwork> nets;
+    if (ensure_config_mutex() != ESP_OK) return nets;
+    nets.reserve(IDF_MAX_WIFI_NETWORKS);
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_config.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!s_config.wifiNetworks[i].ssid.empty()) nets.push_back(s_config.wifiNetworks[i]);
+    }
+    xSemaphoreGive(s_config_mutex);
+    return nets;
+}
+
+int idf_config_wifi_network_count(void)
+{
+    if (ensure_config_mutex() != ESP_OK) return 0;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    int count = s_config.wifiNetworkCount;
+    xSemaphoreGive(s_config_mutex);
+    return count;
 }
 
 bool idf_config_email_configured(void)

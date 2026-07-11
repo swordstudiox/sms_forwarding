@@ -155,7 +155,7 @@
         ADMIN_PHONE: htmlEsc(c.adminPhone || ''), NUMBER_BLACK_LIST: htmlEsc(c.numberBlackList || ''), FORWARD_RULES: htmlEsc(c.forwardRules || ''),
         SMTP_CHECK: c.emailConfigured ? '已配置' : '未配置', EMAIL_EN: checked(c.emailEnabled), PUSH_EN: checked(c.pushEnabled),
         MODEM_CHECK: c.modemReady ? '已就绪' : '未就绪', PUSH_COUNT: String(c.pushEnabledCount || 0), INBOX_MAX: String(c.inboxMax || ''),
-        NTP: htmlEsc(c.ntpServer || ''), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
+        NTP: htmlEsc(c.ntpServer || ''), MDNS_HOST: htmlEsc(c.mdnsHost || 'sms'), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
         HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: buildTzOptions(c.tzOffsetMin),
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
@@ -1605,7 +1605,7 @@
 
     // ---- WiFi settings ----
     var wifiNetworks = [];
-    var WIFI_MAX_NETWORKS = 8;
+    var WIFI_MAX_NETWORKS = 5;
     function setWifiScanMessage(text) {
       var sel = document.getElementById('wifiScanSel');
       if (!sel) return;

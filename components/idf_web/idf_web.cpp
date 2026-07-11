@@ -561,6 +561,7 @@ static esp_err_t send_config_json(httpd_req_t* req)
               idf_modem_get_status().modemReady ? "true" : "false");
     body += buf;
     json_prop(body, "ntpServer", cfg.ntpServer); body += ",";
+    json_prop(body, "mdnsHost", cfg.mdnsHost); body += ",";
     snprintf(buf, sizeof(buf),
              "\"tzOffsetMin\":%d,\"rebootEnabled\":%s,\"rebootHour\":%d,"
              "\"hbEnabled\":%s,\"hbHour\":%d,\"dataEnabled\":%s,\"roamingEnabled\":%s,",
@@ -1330,12 +1331,14 @@ static esp_err_t handle_save(httpd_req_t* req)
     const bool system_sched_form = has_field(fields, "systemSchedForm");
     const bool sim_form = has_field(fields, "simForm");
     const bool call_form = has_field(fields, "callForm");
+    const bool mdns_form = has_field(fields, "mdnsForm");
     const int form_count = (account_form ? 1 : 0) + (tz_form ? 1 : 0) +
                            (led_form ? 1 : 0) + (email_form ? 1 : 0) +
                            (push_form ? 1 : 0) + (filter_form ? 1 : 0) +
                            (rules_form ? 1 : 0) + (ka_form ? 1 : 0) +
                            (st_form ? 1 : 0) + (system_sched_form ? 1 : 0) +
-                           (sim_form ? 1 : 0) + (call_form ? 1 : 0);
+                           (sim_form ? 1 : 0) + (call_form ? 1 : 0) +
+                           (mdns_form ? 1 : 0);
     if (form_count != 1) {
         idf_log_line(form_count == 0 ? "网页保存请求缺少表单标记，已忽略"
                                      : "网页保存请求包含多个表单标记，已拒绝");
@@ -1370,6 +1373,12 @@ static esp_err_t handle_save(httpd_req_t* req)
                                              field_text(fields, "ntpServer"));
         if (err != ESP_OK) return fail(err);
         return ok("网页保存时间设置");
+    }
+
+    if (mdns_form) {
+        esp_err_t err = idf_config_save_mdns_host(field_text(fields, "mdnsHost"));
+        if (err != ESP_OK) return fail(err);
+        return ok("网页保存 mDNS 主机名");
     }
 
     if (led_form) {

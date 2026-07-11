@@ -32,7 +32,13 @@ static constexpr size_t OUT_SMS_QUEUE_MAX = 3;
 static constexpr size_t SEEN_RING_MAX = 32;
 static constexpr size_t CONCAT_SLOTS = 5;
 static constexpr size_t CONCAT_PARTS = 10;
-static constexpr int64_t CONCAT_TIMEOUT_US = 30LL * 1000LL * 1000LL;
+// 30s(Arduino 原值)在真实网络下太短：SIM 满被拒收的分段要等 SMSC 按分钟级
+// 间隔重投，+CMTI 丢失时也要等轮询兜底，30s 一到就强拼出"[缺失分段]"残句。
+// 放宽到 5 分钟，期间由 CONCAT_HUNT_POLL_MS 快轮询主动补齐缺失分段。
+static constexpr int64_t CONCAT_TIMEOUT_US = 300LL * 1000LL * 1000LL;
+// 存在未拼完的长短信时的加速轮询间隔：缺失分段若已落在 SIM 里(通知丢失)，
+// 10s 内即可捞回，而不是等最长 60s 的常规轮询
+static constexpr uint32_t CONCAT_HUNT_POLL_MS = 10000;
 static constexpr uint32_t SMS_POLL_INTERVAL_MS = 60000;
 static constexpr uint32_t SMS_STARTUP_POLL_INTERVAL_MS = 8000;
 static constexpr uint32_t SMS_STARTUP_FAST_WINDOW_MS = 120000;
@@ -468,6 +474,51 @@ static std::string assemble_concat(const ConcatSlot& slot)
 
 static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw);
 
+// 已成功合并的长短信登记环：SIM 满时部分分段被拒收，SMSC 会整条重投(同 ref)。
+// 槽位合并完成后迟到的重复分段若不识别，会重新开槽并在超时后拼出一条
+// "[缺失分段]"幽灵消息。按 (ref,发件人,总段数,分段内容哈希) 精确匹配才丢弃，
+// 避免运营商短期复用 ref 时误杀真实新消息。
+struct ConcatDone {
+    bool used = false;
+    int ref = 0;
+    int total = 0;
+    std::string sender;
+    std::array<uint32_t, CONCAT_PARTS> partHash = {};
+    int64_t doneUs = 0;
+};
+static constexpr int64_t CONCAT_DONE_TTL_US = 10LL * 60 * 1000 * 1000;
+static std::array<ConcatDone, 4> s_concat_done = {};
+static size_t s_concat_done_next = 0;
+
+static bool concat_recently_done(int ref, const std::string& sender, int total,
+                                 int part, const std::string& text)
+{
+    int64_t now = esp_timer_get_time();
+    for (const auto& d : s_concat_done) {
+        if (!d.used || now - d.doneUs > CONCAT_DONE_TTL_US) continue;
+        if (d.ref == ref && d.total == total && d.sender == sender &&
+            d.partHash[part - 1] == fnv1a32(text)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void record_concat_done(const ConcatSlot& slot)
+{
+    ConcatDone& d = s_concat_done[s_concat_done_next];
+    s_concat_done_next = (s_concat_done_next + 1) % s_concat_done.size();
+    d.used = true;
+    d.ref = slot.ref;
+    d.total = slot.total;
+    d.sender = slot.sender;
+    d.partHash.fill(0);
+    for (int i = 0; i < slot.total && i < static_cast<int>(CONCAT_PARTS); ++i) {
+        if (slot.parts[i].valid) d.partHash[i] = fnv1a32(slot.parts[i].text);
+    }
+    d.doneUs = esp_timer_get_time();
+}
+
 static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int total)
 {
     int64_t now = esp_timer_get_time();
@@ -561,6 +612,10 @@ static void handle_decoded_pdu(const DecodedSms& sms)
             process_sms_content(sender, text, ts);
             return;
         }
+        if (concat_recently_done(ref, sender ? sender : "", total, part, text ? text : "")) {
+            idf_logf("长短信分段 ref=%d %d/%d 与近期已合并消息重复，忽略", ref, part, total);
+            return;
+        }
         ConcatSlot& slot = find_concat_slot(ref, sender ? sender : "", total);
         int idx = part - 1;
         if (!slot.parts[idx].valid) {
@@ -572,6 +627,7 @@ static void handle_decoded_pdu(const DecodedSms& sms)
             idf_logf("收到长短信分段 ref=%d %d/%d", ref, part, total);
         }
         if (slot.received >= slot.total) {
+            record_concat_done(slot);
             std::string full = assemble_concat(slot);
             process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str());
             clear_concat_slot(slot);
@@ -613,6 +669,15 @@ static bool decode_pdu_line(const std::string& line)
     // PDU 解码器是全局复用对象；业务处理放到锁外，避免入库/转发时阻塞网页发短信编码。
     handle_decoded_pdu(decoded);
     return true;
+}
+
+// 是否有等待补齐的长短信槽位(仅 sms_task 内访问，无需加锁)
+static bool concat_waiting()
+{
+    for (const auto& slot : s_concat) {
+        if (slot.active && slot.received < slot.total) return true;
+    }
+    return false;
 }
 
 static void expire_concat_slots()
@@ -1027,6 +1092,9 @@ static void sms_task(void*)
             uint32_t interval = (now_ms - start_ms < SMS_STARTUP_FAST_WINDOW_MS)
                 ? SMS_STARTUP_POLL_INTERVAL_MS
                 : SMS_POLL_INTERVAL_MS;
+            // 长短信缺段等待期加速轮询：缺失分段可能已静默落在 SIM 里
+            // (+CMTI 混进大响应被截断丢失)，主动补收而不是干等常规轮询
+            if (concat_waiting() && interval > CONCAT_HUNT_POLL_MS) interval = CONCAT_HUNT_POLL_MS;
             if (first_backfill || now_ms - last_poll_ms >= interval) {
                 if (!first_backfill && (poll_count % SMS_CNMI_REASSERT_EVERY) == 0) {
                     reassert_step = 1;

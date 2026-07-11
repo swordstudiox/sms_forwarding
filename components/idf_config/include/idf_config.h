@@ -9,7 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr int IDF_MAX_WIFI_NETWORKS = 8;
+static constexpr int IDF_MAX_WIFI_NETWORKS = 5;
 static constexpr const char* IDF_FW_VERSION = "1.0.9-fork.1";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
@@ -81,6 +81,7 @@ struct IdfConfig {
 
     int tzOffsetMin = 480;
     std::string ntpServer = "ntp.aliyun.com";
+    std::string mdnsHost = "sms";  // mDNS 主机名(<host>.local)，多设备部署可改名避免互相顶替
     bool rebootEnabled = false;
     int rebootHour = 4;
     bool hbEnabled = false;
@@ -112,12 +113,15 @@ esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork networks[IDF_MAX_WI
                                         const bool clear_passes[IDF_MAX_WIFI_NETWORKS]);
 esp_err_t idf_config_save_account(const std::string& user, const std::string& pass);
 esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server);
+esp_err_t idf_config_save_mdns_host(const std::string& host);
+esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass);
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
                                 const std::string& user, const std::string& pass,
                                 const std::string& send_to, bool preserve_blank_pass);
 esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS]);
 esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::string& number_blacklist);
 esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::string* message);
+std::string idf_config_translate_perl_classes(const std::string& pattern);
 esp_err_t idf_config_save_forward_rules(const std::string& rules);
 esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t action,
                                     const std::string& target, const std::string& url,
@@ -170,6 +174,7 @@ struct IdfConfigWebView {
     bool pushEnabled = true;
     int pushEnabledCount = 0;
     std::string ntpServer = "ntp.aliyun.com";
+    std::string mdnsHost = "sms";
     int tzOffsetMin = 480;
     bool rebootEnabled = false;
     int rebootHour = 4;
@@ -307,3 +312,6 @@ bool idf_config_call_notify_enabled(void);
 // 避免深拷贝整个 IdfConfig 到小栈上导致爆栈
 int idf_config_get_tz_offset(void);
 std::string idf_config_get_ntp_server(void);
+void idf_config_copy_mdns_host(char* out, size_t cap);
+std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void);
+int idf_config_wifi_network_count(void);

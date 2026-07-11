@@ -1,6 +1,6 @@
 <div class="panel" id="panel-settings">
       <h1 class="page-title">系统设置</h1>
-      <p class="page-subtitle">管理账号、设备时间与维护（重启 / 配置备份 / 固件升级）</p>
+      <p class="page-subtitle">管理账号、设备时间、局域网域名与维护（重启 / 配置备份 / 固件升级）</p>
       <div class="card-grid">
         <form action="/save" method="POST" id="mainForm">
         <input type="hidden" name="accountForm" value="1">
@@ -23,6 +23,17 @@
             <div class="form-group"><label class="form-label">NTP 服务器</label><input class="form-input" type="text" name="ntpServer" value="%NTP%" placeholder="ntp.aliyun.com"></div>
             <p class="form-hint">用于设备对时与本地时间显示；保号倒计时依赖对时，修改 NTP 需重启生效</p>
             <button type="submit" class="btn btn-primary btn-block" style="margin-top:4px;">保存时间</button>
+          </div>
+        </div>
+        </form>
+        <form action="/save" method="POST">
+        <input type="hidden" name="mdnsForm" value="1">
+        <div class="card">
+          <div class="card-header">局域网域名 (mDNS)</div>
+          <div class="card-body">
+            <div class="form-group"><label class="form-label">主机名</label><input class="form-input" type="text" name="mdnsHost" value="%MDNS_HOST%" placeholder="sms" maxlength="32"></div>
+            <p class="form-hint">通过 http://主机名.local 访问设备；多台设备请设置不同主机名，避免互相顶替。仅限小写字母、数字和连字符，保存后约 1 秒生效，无需重启</p>
+            <button type="submit" class="btn btn-primary btn-block" style="margin-top:4px;">保存主机名</button>
           </div>
         </div>
         </form>
@@ -56,7 +67,7 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-header">固件升级 (OTA)</div>
+            <div class="card-header">固件升级 (OTA)</div>
           <div class="card-body">
             <input class="form-input" type="file" id="otaFile" accept=".bin">
             <input class="form-input" type="text" id="otaSha256" placeholder="可选：固件 SHA-256（64 位十六进制）" style="margin-top:8px;">

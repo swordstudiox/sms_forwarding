@@ -70,6 +70,7 @@ static esp_err_t start_provisioning_ap(bool manual = false, bool temporary = fal
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static bool schedule_sta_failover(const char* reason);
 static void schedule_ap_close(uint32_t delay_ms);
+static void wifi_remember_task(void*);
 
 struct StaCredential {
     std::string ssid;
@@ -119,7 +120,9 @@ static void ap_close_timer_cb(void*)
     if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
         set_ap_state(false, false, std::string());
         if (s_sta_connected.load(std::memory_order_relaxed)) {
-            idf_log_line("配网热点已关闭，请改用设备 IP 或 http://sms.local 访问");
+            char host[33] = {};
+            idf_config_copy_mdns_host(host, sizeof(host));
+            idf_logf("配网热点已关闭，请改用设备 IP 或 http://%s.local 访问", host);
         } else {
             idf_log_line("临时配网热点已超时关闭，设备继续扫描已知 WiFi");
         }
@@ -491,6 +494,9 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
         }
         start_sntp_once();
+        if (xTaskCreate(wifi_remember_task, "idf_wifi_mem", 4096, nullptr, 2, nullptr) != pdPASS) {
+            ESP_LOGW(TAG, "WiFi 记忆任务创建失败，本次连接不自动记入历史列表");
+        }
         if (s_wifi_event_group) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -510,6 +516,19 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             }
         }
     }
+}
+
+static void wifi_remember_task(void*)
+{
+    wifi_config_t cfg = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.ssid[0]) {
+        char ssid[33] = {};
+        char pass[65] = {};
+        memcpy(ssid, cfg.sta.ssid, sizeof(cfg.sta.ssid));
+        memcpy(pass, cfg.sta.password, sizeof(cfg.sta.password));
+        idf_config_note_wifi_connected(ssid, pass);
+    }
+    vTaskDelete(nullptr);
 }
 
 // 15s 周期重连看门狗：事件链(断开→重连)任何一环失败(如扫描期间 esp_wifi_connect
@@ -626,7 +645,7 @@ static void start_dns_task_once()
     }
 }
 
-// —— 轻量 mDNS 应答器，只服务 sms.local ——
+// —— 轻量 mDNS 应答器，服务 <host>.local(主机名可配置，默认 sms) ——
 // 针对"sms.local 先能用、几分钟后失效"做过的关键修复：
 // 1) 组播成员每 60s 强制退组重加。IGMP snooping 交换机/网状路由在无查询器的
 //    家庭网络里几分钟就老化转发表项，而 lwIP 对已加入的组不会重发 IGMP 报告，
@@ -637,15 +656,29 @@ static void start_dns_task_once()
 // 4) QU 位按单播应答；AAAA 查询回 NSEC(声明只有 A)，双栈解析器不必等超时；
 // 5) 新加组后主动通告两次，客户端无需等到下次查询。
 
-static constexpr char kMdnsName[] = "\x03sms\x05local";
+static constexpr size_t MDNS_NAME_CAP = 40;  // 1 + 32(主机名上限) + 1 + 5("local") = 39
 
-static bool mdns_query_matches_sms_local(const uint8_t* packet, int len, int offset)
+static size_t mdns_encode_name(const char* host, uint8_t* out)
+{
+    size_t host_len = strlen(host);
+    if (host_len == 0 || host_len > 32) { host = "sms"; host_len = 3; }
+    size_t n = 0;
+    out[n++] = static_cast<uint8_t>(host_len);
+    memcpy(out + n, host, host_len);
+    n += host_len;
+    out[n++] = 5;
+    memcpy(out + n, "local", 5);
+    return n + 5;
+}
+
+static bool mdns_query_matches_host(const uint8_t* packet, int len, int offset,
+                                    const uint8_t* name, size_t name_len)
 {
     int pos = offset;
-    for (size_t i = 0; i < sizeof(kMdnsName) - 1; ++i) {
+    for (size_t i = 0; i < name_len; ++i) {
         if (pos >= len) return false;
         char a = static_cast<char>(packet[pos++]);
-        char b = kMdnsName[i];
+        char b = static_cast<char>(name[i]);
         if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
         if (a != b) return false;
     }
@@ -681,10 +714,10 @@ struct MdnsAnswerPlan {
     uint16_t firstQtype = 0;
 };
 
-static int mdns_append_name(uint8_t* buf, int out)
+static int mdns_append_name(uint8_t* buf, int out, const uint8_t* name, size_t name_len)
 {
-    memcpy(buf + out, kMdnsName, sizeof(kMdnsName) - 1);
-    out += sizeof(kMdnsName) - 1;
+    memcpy(buf + out, name, name_len);
+    out += name_len;
     buf[out++] = 0;
     return out;
 }
@@ -698,8 +731,9 @@ static int mdns_append_ttl(uint8_t* buf, int out, uint32_t ttl)
     return out;
 }
 
-// resp 至少 128 字节：头 12 + 问题 15 + A 记录 25 + NSEC 35 = 87
-static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const uint8_t ip[4])
+// resp 至少 256 字节：主机名取上限 32 时，头 12 + 问题 45 + A 记录 55 + NSEC 96 ≈ 208
+static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const uint8_t ip[4],
+                               const uint8_t* name, size_t name_len)
 {
     uint32_t ttl = plan.legacy ? 10 : 120;             // RFC 6762 §6.7 传统应答 TTL≤10s
     uint16_t rrclass = plan.legacy ? 0x0001 : 0x8001;  // 传统应答不设 cache-flush 位
@@ -713,13 +747,13 @@ static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const 
     resp[out++] = 0; resp[out++] = 0;
     resp[out++] = 0; resp[out++] = 0;
     if (plan.legacy) {  // 传统应答需回带问题段
-        out = mdns_append_name(resp, out);
+        out = mdns_append_name(resp, out, name, name_len);
         resp[out++] = static_cast<uint8_t>(plan.firstQtype >> 8);
         resp[out++] = static_cast<uint8_t>(plan.firstQtype);
         resp[out++] = 0; resp[out++] = 1;
     }
     if (plan.wantA) {
-        out = mdns_append_name(resp, out);
+        out = mdns_append_name(resp, out, name, name_len);
         resp[out++] = 0; resp[out++] = 1;  // A
         resp[out++] = static_cast<uint8_t>(rrclass >> 8);
         resp[out++] = static_cast<uint8_t>(rrclass);
@@ -728,13 +762,15 @@ static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const 
         memcpy(resp + out, ip, 4); out += 4;
     }
     if (plan.wantNsec) {
-        out = mdns_append_name(resp, out);
+        out = mdns_append_name(resp, out, name, name_len);
         resp[out++] = 0; resp[out++] = 0x2F;  // NSEC
         resp[out++] = static_cast<uint8_t>(rrclass >> 8);
         resp[out++] = static_cast<uint8_t>(rrclass);
         out = mdns_append_ttl(resp, out, ttl);
-        resp[out++] = 0; resp[out++] = 14;    // rdlength = 名字 11 + 位图 3
-        out = mdns_append_name(resp, out);    // next domain = 自身
+        uint16_t rdlen = static_cast<uint16_t>(name_len + 1 + 3);  // next domain + 位图 3
+        resp[out++] = static_cast<uint8_t>(rdlen >> 8);
+        resp[out++] = static_cast<uint8_t>(rdlen);
+        out = mdns_append_name(resp, out, name, name_len);  // next domain = 自身
         resp[out++] = 0; resp[out++] = 1; resp[out++] = 0x40;  // 窗口 0 长度 1，仅类型 1(A)
     }
     return out;
@@ -771,6 +807,12 @@ static void mdns_sms_task(void*)
     uint8_t ttl = 255;  // RFC 6762 要求组播 TTL=255
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
+    char host[33] = {};
+    uint8_t name[MDNS_NAME_CAP];
+    size_t name_len = 0;
+    idf_config_copy_mdns_host(host, sizeof(host));
+    name_len = mdns_encode_name(host, name);
+
     auto sta_addr = []() -> uint32_t {
         esp_netif_ip_info_t ip = {};
         if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
@@ -800,7 +842,7 @@ static void mdns_sms_task(void*)
             if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &a, sizeof(a)) == 0) {
                 tracked = cur;
                 if (changed) {
-                    idf_log_line("mDNS 已加入组播: http://sms.local");
+                    idf_logf("mDNS 已加入组播: http://%s.local", host);
                     return true;
                 }
             }
@@ -813,7 +855,7 @@ static void mdns_sms_task(void*)
     int64_t last_refresh_us = esp_timer_get_time();
     int announce_left = 0;
     uint8_t req[512];
-    uint8_t resp[128];
+    uint8_t resp[256];
 
     while (true) {
         sockaddr_in from = {};
@@ -821,6 +863,17 @@ static void mdns_sms_task(void*)
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
         // 同配网 DNS：立即报错时让出 CPU，防止 lwIP 内存紧张期高优先级忙等
         if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
+
+        {
+            char cur_host[33] = {};
+            idf_config_copy_mdns_host(cur_host, sizeof(cur_host));
+            if (strcmp(cur_host, host) != 0) {
+                strcpy(host, cur_host);
+                name_len = mdns_encode_name(host, name);
+                announce_left = 2;
+                idf_logf("mDNS 主机名已切换: http://%s.local", host);
+            }
+        }
 
         // recv 超时约 1s 一轮：网卡一变立即迁移；每 60s 强制刷新对抗 snooping 老化
         int64_t now_us = esp_timer_get_time();
@@ -835,7 +888,7 @@ static void mdns_sms_task(void*)
             if (mdns_pick_ip(0, ip)) {
                 MdnsAnswerPlan ann;
                 ann.wantA = true;
-                int n = mdns_build_response(resp, ann, ip);
+                int n = mdns_build_response(resp, ann, ip, name, name_len);
                 sockaddr_in dst = {};
                 dst.sin_family = AF_INET;
                 dst.sin_port = htons(5353);
@@ -854,7 +907,7 @@ static void mdns_sms_task(void*)
         plan.legacy = (from.sin_port != htons(5353));
         if (plan.legacy) plan.id = (static_cast<uint16_t>(req[0]) << 8) | req[1];
         for (uint16_t q = 0; q < qd && pos < len; ++q) {
-            bool matched = mdns_query_matches_sms_local(req, len, pos);
+            bool matched = mdns_query_matches_host(req, len, pos, name, name_len);
             // 跳过名字：0xC0 开头的压缩指针是 2 字节终结符，不能当长度前缀
             while (pos < len) {
                 uint8_t b = req[pos];
@@ -878,7 +931,7 @@ static void mdns_sms_task(void*)
 
         uint8_t ip[4] = {};
         if (!mdns_pick_ip(from.sin_addr.s_addr, ip)) continue;
-        int n = mdns_build_response(resp, plan, ip);
+        int n = mdns_build_response(resp, plan, ip, name, name_len);
         sockaddr_in dst = {};
         if (plan.unicast) {
             dst = from;
@@ -895,7 +948,7 @@ static void start_mdns_task_once()
 {
     bool expected = false;
     if (!s_mdns_task_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
-    BaseType_t ok = xTaskCreate(mdns_sms_task, "idf_mdns", 3072, nullptr, 2, nullptr);
+    BaseType_t ok = xTaskCreate(mdns_sms_task, "idf_mdns", 3456, nullptr, 2, nullptr);
     if (ok != pdPASS) {
         s_mdns_task_started.store(false, std::memory_order_relaxed);
         idf_log_line("mDNS responder 启动失败");

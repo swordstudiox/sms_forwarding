@@ -1570,7 +1570,6 @@ static bool process_forward_one()
     }
 
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
-    const std::string receiver = local_phone_number();
     ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text);
     if (fd.matched && fd.drop) {
         idf_logf("转发规则命中：丢弃短信 id=%u", static_cast<unsigned>(job.inboxId));
@@ -1631,6 +1630,7 @@ static bool process_forward_one()
             if (dispatched > 0) job.pushQueued = true;
         }
         if (!enqueue_failed && will_queue_email) {
+            const std::string receiver = local_phone_number();
             // 主题只放正文前若干字符(全文在正文里)，避免超长 Subject 被严格 MTA 拒收
             std::string subject = "短信";
             subject += job.sender;
@@ -1781,7 +1781,8 @@ static bool process_email_one()
         if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
             bool purged = false;
             for (auto& j : s_email_jobs) {
-                if (j.used) purged = true;
+                if (!j.used) continue;
+                purged = true;
                 cancel_forward_completion_locked(j.completionId);
                 j = EmailJob();
             }
