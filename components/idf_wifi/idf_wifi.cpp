@@ -32,7 +32,7 @@
 static const char* TAG = "idf_wifi";
 static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 static constexpr EventBits_t WIFI_FAIL_BIT = BIT1;
-static constexpr int WIFI_CONNECT_TIMEOUT_MS = 15000;
+static constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr int WIFI_FAILOVER_OFFLINE_MS = 30000;
 static constexpr int WIFI_BOOT_RESCUE_AP_MS = 60000;
 static constexpr uint32_t WIFI_RESCUE_AP_HOLD_MS = 600000;
@@ -1182,6 +1182,19 @@ static bool sta_wait_connect_result(const StaCredential& cred)
 
 static bool sta_try_candidates_once(std::vector<StaCredential>& candidates)
 {
+    if (candidates.size() <= 1) {
+        if (candidates.empty()) return false;
+        esp_err_t err = connect_sta_begin(candidates[0], false);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "已知 WiFi 连接发起失败(%s): %s",
+                     esp_err_to_name(err), candidates[0].ssid.c_str());
+            idf_logf("已知 WiFi 连接发起失败(%s): %s",
+                     esp_err_to_name(err), candidates[0].ssid.c_str());
+            return false;
+        }
+        return sta_wait_connect_result(candidates[0]);
+    }
+
     std::vector<StaCredential> ordered = ordered_candidates_by_scan(candidates);
     for (size_t i = 0; i < ordered.size(); ++i) {
         esp_err_t err = connect_sta_begin(ordered[i], i > 0);
