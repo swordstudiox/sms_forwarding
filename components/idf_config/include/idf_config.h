@@ -9,7 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr int IDF_MAX_WIFI_NETWORKS = 5;
+static constexpr int IDF_MAX_WIFI_NETWORKS = 8;
 static constexpr const char* IDF_FW_VERSION = "1.0.8-fork.1";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";

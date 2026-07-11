@@ -1605,7 +1605,7 @@
 
     // ---- WiFi settings ----
     var wifiNetworks = [];
-    var WIFI_MAX_NETWORKS = 5;
+    var WIFI_MAX_NETWORKS = 8;
     function setWifiScanMessage(text) {
       var sel = document.getElementById('wifiScanSel');
       if (!sel) return;
