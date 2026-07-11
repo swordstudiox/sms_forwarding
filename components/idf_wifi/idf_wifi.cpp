@@ -34,7 +34,6 @@ static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 static constexpr EventBits_t WIFI_FAIL_BIT = BIT1;
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr int WIFI_FAILOVER_OFFLINE_MS = 30000;
-static constexpr int WIFI_BOOT_RESCUE_AP_MS = 60000;
 static constexpr uint32_t WIFI_RESCUE_AP_HOLD_MS = 600000;
 static constexpr const char* AP_SSID_PREFIX = "SMS-Forwarder-";
 static constexpr gpio_num_t PROVISION_BUTTON_PIN = GPIO_NUM_9;
@@ -124,7 +123,7 @@ static void ap_close_timer_cb(void*)
             idf_config_copy_mdns_host(host, sizeof(host));
             idf_logf("配网热点已关闭，请改用设备 IP 或 http://%s.local 访问", host);
         } else {
-            idf_log_line("临时配网热点已超时关闭，设备继续扫描已知 WiFi");
+            idf_log_line("配网热点已关闭，设备继续扫描已知 WiFi");
         }
     }
 }
@@ -494,7 +493,8 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
         }
         start_sntp_once();
-        if (xTaskCreate(wifi_remember_task, "idf_wifi_mem", 4096, nullptr, 2, nullptr) != pdPASS) {
+        // 记忆连接会经由 idf_config_note_wifi_connected() 复制并保存完整配置，4KB 容易触发栈保护。
+        if (xTaskCreate(wifi_remember_task, "idf_wifi_mem", 8192, nullptr, 2, nullptr) != pdPASS) {
             ESP_LOGW(TAG, "WiFi 记忆任务创建失败，本次连接不自动记入历史列表");
         }
         if (s_wifi_event_group) {
@@ -1211,21 +1211,12 @@ static bool sta_try_candidates_once(std::vector<StaCredential>& candidates)
     return false;
 }
 
-// 等待首连结果：扫描当前环境，优先尝试信号最好的已知 WiFi。
-// 开机阶段允许 60 秒后开启临时配网热点，运行中掉线不走这里。
+// 等待首连结果：单组网络直连，多组网络扫描选优；全部失败后开启限时救援 AP。
 static void sta_try_candidates(std::vector<StaCredential>& candidates)
 {
-    int64_t start_us = esp_timer_get_time();
-    while (esp_timer_get_time() - start_us <
-           static_cast<int64_t>(WIFI_BOOT_RESCUE_AP_MS) * 1000LL) {
-        if (sta_try_candidates_once(candidates)) return;
-        int64_t elapsed_ms = (esp_timer_get_time() - start_us) / 1000LL;
-        if (elapsed_ms < WIFI_BOOT_RESCUE_AP_MS) {
-            vTaskDelay(pdMS_TO_TICKS(std::min<int64_t>(3000, WIFI_BOOT_RESCUE_AP_MS - elapsed_ms)));
-        }
-    }
-    ESP_LOGW(TAG, "开机60秒仍未连上已知 WiFi，开启临时配网热点");
-    idf_log_line("开机60秒仍未连上已知 WiFi，开启临时配网热点");
+    if (sta_try_candidates_once(candidates)) return;
+    ESP_LOGW(TAG, "全部已知 WiFi 首次连接失败，开启10分钟临时配网热点");
+    idf_log_line("全部已知 WiFi 首次连接失败，开启10分钟临时配网热点");
     ESP_ERROR_CHECK_WITHOUT_ABORT(start_provisioning_ap(false, true));
 }
 
