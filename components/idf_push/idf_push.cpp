@@ -148,6 +148,13 @@ static std::atomic<bool> s_busy{false};
 static uint8_t s_channel_fails[IDF_MAX_PUSH_CHANNELS] = {};
 static int64_t s_channel_cool_until_us[IDF_MAX_PUSH_CHANNELS] = {};
 
+struct SmtpDeadlineGuard {
+    ~SmtpDeadlineGuard()
+    {
+        s_smtp_session_deadline = 0;
+    }
+};
+
 static bool ensure_init()
 {
     if (!s_mutex) {
@@ -1189,6 +1196,7 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
     SmtpConn conn;
     // 会话总限从连接前开始计：DNS/TCP/TLS/9 轮命令共享 120s，任何一环慢都不能无限拖
     s_smtp_session_deadline = esp_timer_get_time() + SMTP_SESSION_MAX_US;
+    SmtpDeadlineGuard deadline_guard;
     idf_logf("连接SMTP服务器: %s:%d", server.c_str(), cfg.smtpPort);
     if (cfg.smtpPort == 465) {
         conn.implicitTls = esp_tls_init();
@@ -1244,7 +1252,6 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
     if (ok) smtp_command(conn, "QUIT", 221);
     else smtp_conn_write_all(conn, "QUIT\r\n");  // 失败路径不再等 QUIT 响应，避免死连接再吃 15s
     smtp_conn_close(conn);
-    s_smtp_session_deadline = 0;
     idf_log_line(ok ? "邮件发送完成" : "邮件发送失败");
     return ok;
 }
