@@ -112,7 +112,7 @@
         var folded = !en;
         html += '<div class="push-channel' + (en ? ' enabled' : '') + (folded ? ' folded' : '') + (configured ? ' configured' : '') + '" id="channel' + idx + '" data-configured="' + (configured ? '1' : '0') + '">';
         html += '<div class="push-channel-header">';
-        html += '<input type="checkbox" class="switch-input" name="push' + idx + 'en" id="push' + idx + 'en" onchange="toggleChannel(' + idx + ')"' + (en ? ' checked' : '') + '><span class="switch-slider"></span>';
+        html += '<label class="switch-inline"><input type="checkbox" class="switch-input" name="push' + idx + 'en" id="push' + idx + 'en" onchange="toggleChannel(' + idx + ')"' + (en ? ' checked' : '') + '><span class="switch-slider"></span></label>';
         html += '<label for="push' + idx + 'en" class="label-inline">启用推送通道 ' + (i + 1) + '</label>';
         html += '<span class="ch-summary" id="chsum' + idx + '"></span>';
         html += '<button type="button" class="channel-fold" onclick="toggleChannelBody(' + idx + ')" id="foldBtn' + idx + '">展开</button>';
@@ -981,7 +981,7 @@
       card.style.display = 'none';
       card.innerHTML =
         '<div class="push-channel-header">' +
-          '<input type="checkbox" class="switch-input" name="st' + i + 'En" id="st' + i + 'En" onchange="stSyncHead(' + i + ')"><span class="switch-slider"></span>' +
+          '<label class="switch-inline"><input type="checkbox" class="switch-input" name="st' + i + 'En" id="st' + i + 'En" onchange="stSyncHead(' + i + ')"><span class="switch-slider"></span></label>' +
           '<label for="st' + i + 'En" class="label-inline">启用任务 ' + (i + 1) + '</label>' +
           '<span class="ch-summary" id="st' + i + 'Sum"></span>' +
           '<span class="schedule-tag" id="st' + i + 'Countdown" style="margin-left:auto;">--</span>' +
