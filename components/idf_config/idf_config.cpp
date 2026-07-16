@@ -1273,6 +1273,37 @@ static esp_err_t commit_field_save(nvs_handle_t nvs, esp_err_t err, const char* 
     return err;
 }
 
+static esp_err_t write_wifi_network_fields(nvs_handle_t nvs,
+                                           const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                           uint8_t count)
+{
+    esp_err_t err = nvs_set_u8(nvs, "wifiCount", count);
+    for (int i = 0; err == ESP_OK && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        char ssid_key[20];
+        char pass_key[20];
+        snprintf(ssid_key, sizeof(ssid_key), "wifi%dSsid", i);
+        snprintf(pass_key, sizeof(pass_key), "wifi%dPass", i);
+        const bool active = i < count;
+        err = write_str(nvs, ssid_key, active ? networks[i].ssid : std::string());
+        if (err == ESP_OK) err = write_str(nvs, pass_key, active ? networks[i].pass : std::string());
+    }
+    if (err == ESP_OK) err = write_str(nvs, "wifiSsid", count > 0 ? networks[0].ssid : std::string());
+    if (err == ESP_OK) err = write_str(nvs, "wifiPass", count > 0 ? networks[0].pass : std::string());
+    if (err == ESP_OK) err = write_str(nvs, "wifiSsid2", count > 1 ? networks[1].ssid : std::string());
+    if (err == ESP_OK) err = write_str(nvs, "wifiPass2", count > 1 ? networks[1].pass : std::string());
+    return err;
+}
+
+static void update_wifi_config_locked(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
+                                      uint8_t count)
+{
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        s_config.wifiNetworks[i] = i < count ? networks[i] : IdfWifiNetwork{};
+    }
+    s_config.wifiNetworkCount = count;
+    sync_wifi_compat_from_list(s_config);
+}
+
 static esp_err_t commit_config_update_locked(IdfConfig& next, const IdfConfig& base)
 {
     esp_err_t err = normalize_config(next);
@@ -1302,23 +1333,24 @@ static esp_err_t save_wifi_networks_locked(const IdfWifiNetwork networks[IDF_MAX
                                            int count,
                                            const bool preserve_blank_passes[IDF_MAX_WIFI_NETWORKS],
                                            const bool clear_passes[IDF_MAX_WIFI_NETWORKS],
-                                           const IdfConfig& base)
+                                           const IdfWifiNetwork saved[IDF_MAX_WIFI_NETWORKS],
+                                           uint8_t saved_count,
+                                           IdfWifiNetwork out[IDF_MAX_WIFI_NETWORKS],
+                                           uint8_t& out_count)
 {
     if (!networks || count <= 0 || count > IDF_MAX_WIFI_NETWORKS) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    std::unique_ptr<IdfConfig> next_cfg = make_config_copy(base);
-    if (!next_cfg) return ESP_ERR_NO_MEM;
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) next_cfg->wifiNetworks[i] = {};
-    next_cfg->wifiNetworkCount = 0;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) out[i] = {};
+    out_count = 0;
 
     auto saved_pass_for = [&](const std::string& ssid, int index) -> std::string {
-        for (int i = 0; i < base.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS; ++i) {
-            if (base.wifiNetworks[i].ssid == ssid) return base.wifiNetworks[i].pass;
+        for (int i = 0; i < saved_count && i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            if (saved[i].ssid == ssid) return saved[i].pass;
         }
-        if (index >= 0 && index < base.wifiNetworkCount && index < IDF_MAX_WIFI_NETWORKS) {
-            return base.wifiNetworks[index].pass;
+        if (index >= 0 && index < saved_count && index < IDF_MAX_WIFI_NETWORKS) {
+            return saved[index].pass;
         }
         return {};
     };
@@ -1336,13 +1368,20 @@ static esp_err_t save_wifi_networks_locked(const IdfWifiNetwork networks[IDF_MAX
             next.pass = saved_pass_for(next.ssid, i);
         }
         if (next.pass.size() >= 64) return ESP_ERR_INVALID_ARG;
-        if (next_cfg->wifiNetworkCount < IDF_MAX_WIFI_NETWORKS) {
-            next_cfg->wifiNetworks[next_cfg->wifiNetworkCount++] = next;
+        bool dup = false;
+        for (int j = 0; j < out_count; ++j) {
+            if (out[j].ssid == next.ssid) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (out_count < IDF_MAX_WIFI_NETWORKS) {
+            out[out_count++] = next;
         }
     }
-    if (next_cfg->wifiNetworkCount == 0) return ESP_ERR_INVALID_ARG;
-    next_cfg->wifiFromFallback = false;
-    return commit_config_update_locked(*next_cfg, base);
+    if (out_count == 0) return ESP_ERR_INVALID_ARG;
+    return ESP_OK;
 }
 
 esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork networks[IDF_MAX_WIFI_NETWORKS],
@@ -1353,10 +1392,32 @@ esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork networks[IDF_MAX_WI
     esp_err_t mutex_err = ensure_config_mutex();
     if (mutex_err != ESP_OK) return mutex_err;
     if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
-    std::unique_ptr<IdfConfig> base;
-    esp_err_t err = config_snapshot_heap(base);
+
+    IdfWifiNetwork saved[IDF_MAX_WIFI_NETWORKS];
+    uint8_t saved_count = 0;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    saved_count = s_config.wifiNetworkCount;
+    if (saved_count > IDF_MAX_WIFI_NETWORKS) saved_count = IDF_MAX_WIFI_NETWORKS;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) saved[i] = s_config.wifiNetworks[i];
+    xSemaphoreGive(s_config_mutex);
+
+    IdfWifiNetwork next[IDF_MAX_WIFI_NETWORKS];
+    uint8_t next_count = 0;
+    esp_err_t err = save_wifi_networks_locked(networks, count, preserve_blank_passes, clear_passes,
+                                              saved, saved_count, next, next_count);
+    nvs_handle_t nvs = 0;
+    if (err == ESP_OK) err = nvs_open("sms_config", NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
-        err = save_wifi_networks_locked(networks, count, preserve_blank_passes, clear_passes, *base);
+        err = write_wifi_network_fields(nvs, next, next_count);
+        err = commit_field_save(nvs, err, "WiFi 网络列表");
+        nvs = 0;
+    } else if (nvs != 0) {
+        nvs_close(nvs);
+    }
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        update_wifi_config_locked(next, next_count);
+        xSemaphoreGive(s_config_mutex);
     }
     xSemaphoreGive(s_persist_mutex);
     return err;
@@ -1412,7 +1473,24 @@ esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::str
         preserve[count] = true;
         ++count;
     }
-    err = save_wifi_networks_locked(networks, count, preserve, clear, *base);
+    IdfWifiNetwork next[IDF_MAX_WIFI_NETWORKS];
+    uint8_t next_count = 0;
+    err = save_wifi_networks_locked(networks, count, preserve, clear,
+                                    base->wifiNetworks, base->wifiNetworkCount,
+                                    next, next_count);
+    if (err == ESP_OK) {
+        std::unique_ptr<IdfConfig> next_cfg = make_config_copy(*base);
+        if (!next_cfg) {
+            err = ESP_ERR_NO_MEM;
+        } else {
+            for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+                next_cfg->wifiNetworks[i] = i < next_count ? next[i] : IdfWifiNetwork{};
+            }
+            next_cfg->wifiNetworkCount = next_count;
+            next_cfg->wifiFromFallback = false;
+            err = commit_config_update_locked(*next_cfg, *base);
+        }
+    }
     xSemaphoreGive(s_persist_mutex);
     return err;
 }

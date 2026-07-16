@@ -1,12 +1,12 @@
 <div class="panel" id="panel-push">
       <h1 class="page-title">转发设置</h1>
-      <p class="page-subtitle">邮件通知与最多 5 个推送通道（POST JSON、Bark 官方/自建、钉钉、飞书、PushPlus、Server酱、Gotify、Telegram）</p>
-      <div class="card-grid">
-      <div>
+      <p class="page-subtitle">邮件、推送通道、过滤规则与测试发送</p>
+      <div class="card-grid push-layout">
+      <div class="push-col push-col-main">
       <form action="/save" method="POST" id="mainForm2">
       <input type="hidden" name="emailForm" value="1">
       <div class="card">
-        <div class="card-header">邮件通知 (SMTP)</div>
+        <div class="card-header">邮件通知 (SMTP)<span class="card-chip" id="smtpCfgChip">%SMTP_CHECK%</span></div>
         <div class="card-body">
           <label class="switch-row" style="margin-bottom:12px;"><span class="switch-text">启用邮件转发</span><input type="checkbox" class="switch-input" name="emailEnabled" %EMAIL_EN%><span class="switch-slider"></span></label>
           <div class="form-row">
@@ -18,6 +18,11 @@
             <div class="form-group"><label class="form-label">密码 / 授权码</label><input class="form-input" type="password" name="smtpPass" value="%SMTP_PASS%" placeholder="留空不修改授权码"></div>
           </div>
           <div class="form-group"><label class="form-label">接收邮件地址</label><input class="form-input" type="text" name="smtpSendTo" value="%SMTP_SEND_TO%" placeholder="receiver@example.com"></div>
+          <div class="btn-row smtp-test-row">
+            <button type="button" class="btn btn-secondary btn-sm" id="smtpTestBtn" onclick="testSmtp(this)">测试发送</button>
+            <span class="form-hint" style="margin:0;">用当前表单值试发；密码留空则用已保存密码</span>
+          </div>
+          <div class="result-box" id="smtpTestResult"></div>
         </div>
       </div>
       <button type="submit" class="btn btn-primary btn-block btn-save">保存邮件设置</button>
@@ -36,7 +41,7 @@
       <button type="submit" class="btn btn-primary btn-block btn-save">保存推送通道</button>
       </form>
       </div>
-      <div>
+      <div class="push-col push-col-side">
       <form action="/save" method="POST">
       <input type="hidden" name="filterForm" value="1">
       <div class="card">

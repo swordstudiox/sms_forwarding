@@ -190,6 +190,26 @@ static std::string format_epoch_local(uint32_t epoch, int tz_offset_min)
     return std::string(buf);
 }
 
+// 将 PDU SCTS 原始时间戳(YYMMDDHHMMSStz，至少前 12 位为年月日时分秒)
+// 格式化为 "YYYY-MM-DD HH:MM:SS"；异常输入原样返回，避免丢失诊断信息。
+static std::string format_pdu_timestamp(const std::string& raw)
+{
+    if (raw.size() < 12) return raw;
+    for (size_t i = 0; i < 12; ++i) {
+        if (!isdigit(static_cast<unsigned char>(raw[i]))) return raw;
+    }
+    int yy = (raw[0] - '0') * 10 + (raw[1] - '0');
+    int mm = (raw[2] - '0') * 10 + (raw[3] - '0');
+    int dd = (raw[4] - '0') * 10 + (raw[5] - '0');
+    int hh = (raw[6] - '0') * 10 + (raw[7] - '0');
+    int mi = (raw[8] - '0') * 10 + (raw[9] - '0');
+    int ss = (raw[10] - '0') * 10 + (raw[11] - '0');
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             yy + 2000, mm, dd, hh, mi, ss);
+    return std::string(buf);
+}
+
 static std::string canonical_phone(const std::string& num)
 {
     size_t start = 0;
@@ -589,7 +609,7 @@ static void process_sms_content(const char* sender_raw, const char* text_raw, co
     }
 
     std::string display_ts = format_epoch_local(static_cast<uint32_t>(time(nullptr)), cfg.tzOffsetMin);
-    if (display_ts.empty()) display_ts = timestamp;
+    if (display_ts.empty()) display_ts = format_pdu_timestamp(timestamp);
 
     uint32_t id = idf_inbox_add(sender.c_str(), text.c_str(), display_ts.c_str());
     update_status(true, true);

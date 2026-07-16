@@ -171,6 +171,7 @@
       if (stTimer) { clearTimeout(stTimer); stTimer = null; }
       if (esimTimer) { clearTimeout(esimTimer); esimTimer = null; }
       if (latestOtpTimer) { clearTimeout(latestOtpTimer); latestOtpTimer = null; }
+      if (smtpTestTimer) { clearTimeout(smtpTestTimer); smtpTestTimer = null; }
     }
     function cleanupPanelRuntime() {
       stopLogPoll();
@@ -187,6 +188,8 @@
         }
       }
       pushTestBtns = {};
+      if (smtpTestBtnEl) smtpTestBtnEl.disabled = false;
+      smtpTestBtnEl = null;
     }
     function panelHook(name) {
       if (name === 'log') { initLogPanel(); } else { stopLogPoll(); }
@@ -518,6 +521,67 @@
       for (var i = 0; i < 5; i++) { toggleChannel(i); updateTypeHint(i); }
       setupChannels();
     });
+
+    // ---- SMTP Test (form current values; empty password uses saved) ----
+    var smtpTestTimer = null, smtpTestBtnEl = null;
+    function smtpTestDone() {
+      if (smtpTestBtnEl) smtpTestBtnEl.disabled = false;
+      smtpTestBtnEl = null;
+    }
+    function pollTestSmtp() {
+      if (smtpTestTimer) clearTimeout(smtpTestTimer);
+      fetch('/testsmtp?action=status&_=' + Date.now(), { cache: 'no-store' }).then(jsonOrThrow).then(function(d) {
+        var r = document.getElementById('smtpTestResult');
+        if (!r) return;
+        if (d.queued || d.running) {
+          r.className = 'result-box result-loading';
+          r.textContent = d.message || 'SMTP 测试后台执行中...';
+          smtpTestTimer = setTimeout(pollTestSmtp, 3000);
+          return;
+        }
+        smtpTestDone();
+        r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error');
+        r.textContent = d.message || (d.success ? '测试邮件已发送' : '测试邮件失败');
+      }).catch(function(e) {
+        smtpTestDone();
+        var r = document.getElementById('smtpTestResult');
+        if (!r) return;
+        r.className = 'result-box result-error';
+        r.textContent = '状态查询失败: ' + e;
+      });
+    }
+    function testSmtp(btn) {
+      var form = document.getElementById('mainForm2');
+      var r = document.getElementById('smtpTestResult');
+      if (!form || !r) return;
+      if (btn) { smtpTestBtnEl = btn; btn.disabled = true; }
+      var fd = new FormData(form);
+      var params = new URLSearchParams();
+      ['smtpServer', 'smtpPort', 'smtpUser', 'smtpPass', 'smtpSendTo'].forEach(function(k) {
+        params.set(k, fd.get(k) != null ? String(fd.get(k)) : '');
+      });
+      r.className = 'result-box result-loading';
+      r.textContent = '提交 SMTP 测试（使用当前表单值）...';
+      csrfFetch('/testsmtp', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+      }).then(jsonOrThrow).then(function(d) {
+        if (d.success && d.queued) {
+          r.textContent = d.message || '后台 SMTP 测试中...';
+          pollTestSmtp();
+        } else {
+          smtpTestDone();
+          r.className = 'result-box result-error';
+          r.textContent = d.message || '任务启动失败';
+        }
+      }).catch(function(e) {
+        smtpTestDone();
+        r.className = 'result-box result-error';
+        r.textContent = '请求失败: ' + e;
+      });
+    }
 
     // ---- Push Channel Test ----
     var pushTestTimers = {}, pushTestBtns = {};

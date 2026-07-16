@@ -126,6 +126,15 @@ struct TestJob {
     std::string message;
 };
 
+struct SmtpTestJob {
+    bool pending = false;
+    bool running = false;
+    bool done = false;
+    bool success = false;
+    std::string message;
+    IdfEmailSettingsView cfg;
+};
+
 struct ForwardDecision {
     bool matched = false;
     bool drop = false;
@@ -140,6 +149,7 @@ static std::array<PushJob, PUSH_QUEUE_MAX> s_push_jobs;
 static std::array<ForwardJob, FWD_QUEUE_MAX> s_forward_jobs;
 static std::array<EmailJob, EMAIL_QUEUE_MAX> s_email_jobs;
 static std::array<TestJob, IDF_MAX_PUSH_CHANNELS> s_test_jobs;
+static SmtpTestJob s_smtp_test_job;
 static std::array<ForwardCompletion, PUSH_QUEUE_MAX + EMAIL_QUEUE_MAX> s_forward_completions;
 static bool s_started = false;
 static uint32_t s_next_completion_id = 0;
@@ -182,6 +192,7 @@ static void cleanup_start_resources()
     s_forward_jobs = {};
     s_email_jobs = {};
     s_test_jobs = {};
+    s_smtp_test_job = SmtpTestJob();
     s_forward_completions = {};
     s_next_completion_id = 0;
     memset(s_channel_fails, 0, sizeof(s_channel_fails));
@@ -311,9 +322,10 @@ static std::string trim(std::string value)
 
 static std::string local_phone_number()
 {
-    IdfModemStatus modem = idf_modem_get_status();
-    if (!modem.phone.empty()) return modem.phone;
-    return idf_config_get_status_view().phoneNumber;
+    // 手填号码优先：部分 eSIM/漫游卡的 CNUM 可能不上报或报错号。
+    std::string manual = idf_config_get_status_view().phoneNumber;
+    if (!manual.empty()) return manual;
+    return idf_modem_get_status().phone;
 }
 
 static bool parse_push_channel_token(const std::string& value, uint8_t& channel)
@@ -1900,6 +1912,49 @@ static bool process_test_one()
     return true;
 }
 
+static bool process_smtp_test_one()
+{
+    if (!idf_wifi_get_status().staConnected) return false;
+    if (low_heap_defer()) return false;
+
+    IdfEmailSettingsView cfg;
+    bool have = false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    if (s_smtp_test_job.pending) {
+        s_smtp_test_job.pending = false;
+        s_smtp_test_job.running = true;
+        s_smtp_test_job.done = false;
+        s_smtp_test_job.success = false;
+        s_smtp_test_job.message = "SMTP 测试发送中";
+        cfg = s_smtp_test_job.cfg;
+        have = true;
+    }
+    xSemaphoreGive(s_mutex);
+    if (!have) return false;
+
+    std::string ts = format_local_time(idf_config_get_tz_offset());
+    if (ts.empty()) ts = "时间未同步";
+    std::string body = "设备已用当前 SMTP 参数发送测试邮件。\n"
+                       "若收到此信，说明服务器、账号、授权码和收件人配置可用。\n\n"
+                       "发送时间: " + ts;
+
+    s_busy.store(true, std::memory_order_relaxed);
+    bool ok = send_smtp_email(cfg, "SMTP 配置测试", body);
+    s_busy.store(false, std::memory_order_relaxed);
+
+    std::string result = ok ? "测试邮件已发送，请查收收件箱" : "测试邮件发送失败，请检查 SMTP 配置与日志";
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_smtp_test_job.running = false;
+        s_smtp_test_job.done = true;
+        s_smtp_test_job.success = ok;
+        s_smtp_test_job.message = result;
+        // 发送结束后清空密码快照，降低凭据在内存中驻留的时间。
+        s_smtp_test_job.cfg.smtpPass.clear();
+        xSemaphoreGive(s_mutex);
+    }
+    return true;
+}
+
 static void push_task(void*)
 {
     while (true) {
@@ -1907,6 +1962,7 @@ static void push_task(void*)
         if (!did) did = process_push_one();
         if (!did) did = process_email_one();
         if (!did) did = process_test_one();
+        if (!did) did = process_smtp_test_one();
         if (did) {
             vTaskDelay(pdMS_TO_TICKS(10));
         } else if (s_wake_sem) {
@@ -2075,6 +2131,75 @@ std::string idf_push_test_status_json(uint8_t channel)
     TestJob copy;
     if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         copy = s_test_jobs[channel];
+        xSemaphoreGive(s_mutex);
+    }
+    std::string msg = copy.message.empty() ? "未开始测试" : copy.message;
+    std::string out = "{";
+    out += "\"queued\":"; out += copy.pending ? "true" : "false"; out += ",";
+    out += "\"running\":"; out += copy.running ? "true" : "false"; out += ",";
+    out += "\"done\":"; out += copy.done ? "true" : "false"; out += ",";
+    out += "\"success\":"; out += copy.success ? "true" : "false"; out += ",";
+    json_prop(out, "message", msg);
+    out += "}";
+    return out;
+}
+
+bool idf_push_enqueue_smtp_test(const IdfEmailSettingsView& cfg, std::string& message)
+{
+    if (!idf_wifi_get_status().staConnected) {
+        message = "WiFi 未连接，暂不能测试邮件";
+        return false;
+    }
+    if (!cfg.emailConfigured || cfg.smtpServer.empty() || cfg.smtpUser.empty() ||
+        cfg.smtpPass.empty() || cfg.smtpSendTo.empty()) {
+        message = "SMTP 配置不完整（服务器、账号、密码、收件人）";
+        return false;
+    }
+    if (cfg.smtpPort <= 0 || cfg.smtpPort > 65535) {
+        message = "SMTP 端口无效";
+        return false;
+    }
+    if (!ensure_init()) {
+        message = "邮件测试队列初始化失败";
+        return false;
+    }
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        message = "邮件测试队列忙";
+        return false;
+    }
+    bool busy = s_smtp_test_job.pending || s_smtp_test_job.running;
+    if (!busy) {
+        s_smtp_test_job.pending = true;
+        s_smtp_test_job.running = false;
+        s_smtp_test_job.done = false;
+        s_smtp_test_job.success = false;
+        s_smtp_test_job.message = "SMTP 测试已排队";
+        s_smtp_test_job.cfg = cfg;
+        s_smtp_test_job.cfg.emailEnabled = true;
+        s_smtp_test_job.cfg.emailConfigured = true;
+        message = s_smtp_test_job.message;
+    }
+    xSemaphoreGive(s_mutex);
+    if (busy) {
+        message = "SMTP 测试已在后台进行";
+        return true;
+    }
+    wake_worker();
+    return true;
+}
+
+std::string idf_push_smtp_test_status_json(void)
+{
+    if (!ensure_init()) {
+        return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"邮件测试队列初始化失败\"}";
+    }
+    SmtpTestJob copy;
+    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        copy.pending = s_smtp_test_job.pending;
+        copy.running = s_smtp_test_job.running;
+        copy.done = s_smtp_test_job.done;
+        copy.success = s_smtp_test_job.success;
+        copy.message = s_smtp_test_job.message;
         xSemaphoreGive(s_mutex);
     }
     std::string msg = copy.message.empty() ? "未开始测试" : copy.message;

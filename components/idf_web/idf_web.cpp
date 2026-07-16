@@ -491,7 +491,8 @@ static esp_err_t handle_status(httpd_req_t* req)
     }
 
     json_prop(body, "adminPhone", cfg.adminPhone); body += ",";
-    json_prop(body, "phone", modem.phone.empty() ? cfg.phoneNumber : modem.phone); body += ",";
+    // 手填优先于 CNUM：模组读不到或读错本机号码时，可用网络设置纠正。
+    json_prop(body, "phone", !cfg.phoneNumber.empty() ? cfg.phoneNumber : modem.phone); body += ",";
     json_prop(body, "apn", cfg.apn); body += ",";
     json_prop(body, "apnSim", modem.apnSim); body += ",";
     json_prop(body, "cellIp", modem.cellIp); body += ",";
@@ -2208,6 +2209,53 @@ static esp_err_t handle_test_push(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
+static esp_err_t handle_test_smtp(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;
+    if (!ensure_get_or_post(req)) return ESP_OK;
+    std::string action;
+    get_query_param(req, "action", action);
+    set_json_no_cache(req);
+    if (action == "status") {
+        std::string body = idf_push_smtp_test_status_json();
+        return httpd_resp_send(req, body.c_str(), body.size());
+    }
+    if (req->method != HTTP_POST) {
+        return httpd_resp_sendstr(req,
+            "{\"success\":false,\"queued\":false,\"running\":false,\"message\":\"SMTP 测试需使用 POST\"}");
+    }
+    if (!check_csrf(req)) return ESP_OK;
+
+    std::string raw;
+    if (read_body(req, raw, 2048) != ESP_OK) return ESP_OK;
+    IdfFormFields fields = parse_urlencoded(raw);
+
+    IdfEmailSettingsView view;
+    view.emailEnabled = true;
+    view.smtpServer = field_text(fields, "smtpServer");
+    view.smtpPort = field_int(fields, "smtpPort", 465);
+    view.smtpUser = field_text(fields, "smtpUser");
+    view.smtpPass = field_text(fields, "smtpPass");
+    view.smtpSendTo = field_text(fields, "smtpSendTo");
+    if (field_blank(view.smtpPass)) {
+        IdfEmailSettingsView saved = idf_config_get_email_settings_view();
+        view.smtpPass = saved.smtpPass;
+    }
+    view.emailConfigured = !view.smtpServer.empty() && !view.smtpUser.empty() &&
+                           !view.smtpPass.empty() && !view.smtpSendTo.empty();
+
+    std::string msg;
+    bool ok = idf_push_enqueue_smtp_test(view, msg);
+    std::string body = "{\"success\":";
+    body += ok ? "true" : "false";
+    body += ",\"queued\":";
+    body += ok ? "true" : "false";
+    body += ",";
+    json_prop(body, "message", msg);
+    body += "}";
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
 static std::string trim_copy(std::string value)
 {
     size_t start = 0;
@@ -3738,7 +3786,7 @@ esp_err_t idf_web_start(void)
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.lru_purge_enable = true;
     // 多方法接口使用 HTTP_ANY 单路由，实际路由约 37 个；保留余量同时减少 HTTPD 路由表内存
-    config.max_uri_handlers = 48;
+    config.max_uri_handlers = 50;
     config.stack_size = 8192;
     // HTTPD 内部预留 3 个 socket；此外本固件常驻 mDNS/DNS/SNTP，推送/SMTP
     // 也需要余量。已有 build/sdkconfig 可能仍是旧值(如 LWIP=10)，硬设 13
@@ -3866,6 +3914,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/at", register_handler(s_server, "/at", HTTP_ANY, handle_at));
     IDF_WEB_TRY_REGISTER("/ping", register_handler(s_server, "/ping", HTTP_ANY, handle_ping));
     IDF_WEB_TRY_REGISTER("/testpush", register_handler(s_server, "/testpush", HTTP_ANY, handle_test_push));
+    IDF_WEB_TRY_REGISTER("/testsmtp", register_handler(s_server, "/testsmtp", HTTP_ANY, handle_test_smtp));
     IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_ANY, handle_ussd));
     IDF_WEB_TRY_REGISTER("/flight", register_handler(s_server, "/flight", HTTP_ANY, handle_flight));
     IDF_WEB_TRY_REGISTER("/modem", register_handler(s_server, "/modem", HTTP_ANY, handle_modem_control));
