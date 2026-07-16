@@ -11,6 +11,7 @@ on:
       - 'sdkconfig.defaults'
       - 'partitions_ota_1m6.csv'
       - '.github/workflows/build.yml'
+      - '.github/release-notes/**'
   pull_request:
   workflow_dispatch:
 
@@ -25,6 +26,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Verify generated web assets
         run: python tools/build_web_assets.py --check
@@ -70,6 +73,80 @@ jobs:
           echo "ota_sha256=$(sha256sum "$OTA_FILE" | awk '{print toupper($1)}')" >> "$GITHUB_OUTPUT"
           echo "full_sha256=$(sha256sum "$FULL_FILE" | awk '{print toupper($1)}')" >> "$GITHUB_OUTPUT"
 
+      - name: Generate release changelog
+        id: changelog
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          V=${{ steps.version.outputs.version }}
+          CURRENT_TAG="v${V}"
+          PREVIOUS_TAG=""
+          RELEASE_NOTES_FILE=".github/release-notes/v${V}.md"
+
+          REMOTE_TAGS=$(python -c 'import json, os, re, urllib.request; token=os.environ.get("GH_TOKEN", ""); headers={"Accept": "application/vnd.github+json", "User-Agent": "sms-forwarding-release"}; headers.update({"Authorization": "Bearer " + token} if token else {}); req=urllib.request.Request("https://api.github.com/repos/%s/git/matching-refs/tags/v" % os.environ["GITHUB_REPOSITORY"], headers=headers); refs=json.load(urllib.request.urlopen(req, timeout=20)); tags=[item["ref"].rsplit("/", 1)[-1] for item in refs]; tags.sort(key=lambda tag: tuple((0, int(part)) if part.isdigit() else (1, part) for part in re.findall("[0-9]+|[A-Za-z]+", tag)), reverse=True); print("\n".join(tags))' 2>/tmp/release-remote-tags.err)
+          if [ -n "$REMOTE_TAGS" ]; then
+            echo "远程 tags:"
+            printf '%s\n' "$REMOTE_TAGS"
+            PREVIOUS_TAG=$(printf '%s\n' "$REMOTE_TAGS" | grep -vx "$CURRENT_TAG" | head -n 1 || true)
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo "远程 tags 识别上一版本: $PREVIOUS_TAG"
+            fi
+          else
+            echo "远程 tags 为空或读取失败。"
+            if [ -s /tmp/release-remote-tags.err ]; then
+              cat /tmp/release-remote-tags.err
+            fi
+          fi
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            LOCAL_TAGS=$(git tag --list 'v*' --sort=-v:refname)
+            if [ -n "$LOCAL_TAGS" ]; then
+              echo "改用本地 tags:"
+              printf '%s\n' "$LOCAL_TAGS"
+              PREVIOUS_TAG=$(printf '%s\n' "$LOCAL_TAGS" | grep -vx "$CURRENT_TAG" | head -n 1 || true)
+              if [ -n "$PREVIOUS_TAG" ]; then
+                echo "本地 tags 识别上一版本: $PREVIOUS_TAG"
+              fi
+            else
+              echo "本地 tags 为空。"
+            fi
+          fi
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            git fetch --force origin "refs/tags/${PREVIOUS_TAG}:refs/tags/${PREVIOUS_TAG}" || true
+          fi
+
+          {
+            echo 'notes<<EOF'
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo "对比范围：\`${PREVIOUS_TAG}..${GITHUB_SHA}\`"
+              echo
+              if [ -f "$RELEASE_NOTES_FILE" ]; then
+                cat "$RELEASE_NOTES_FILE"
+              else
+                export PREVIOUS_TAG
+                COMPARE_NOTES=$(python -c 'import json, os, urllib.parse, urllib.request; token=os.environ.get("GH_TOKEN", ""); headers={"Accept": "application/vnd.github+json", "User-Agent": "sms-forwarding-release"}; headers.update({"Authorization": "Bearer " + token} if token else {}); base=urllib.parse.quote(os.environ["PREVIOUS_TAG"], safe=""); head=os.environ["GITHUB_SHA"]; req=urllib.request.Request("https://api.github.com/repos/%s/compare/%s...%s" % (os.environ["GITHUB_REPOSITORY"], base, head), headers=headers); data=json.load(urllib.request.urlopen(req, timeout=20)); commits=[item for item in data.get("commits", []) if len(item.get("parents", [])) <= 1]; print("\n".join("- %s (`%s`)" % (item["commit"]["message"].splitlines()[0], item["sha"][:7]) for item in commits))' 2>/tmp/release-compare.err)
+                if [ -n "$COMPARE_NOTES" ]; then
+                  printf '%s\n' "$COMPARE_NOTES"
+                else
+                  if [ -s /tmp/release-compare.err ]; then
+                    cat /tmp/release-compare.err
+                  fi
+                  git log --no-merges --pretty=format:'- %s (`%h`)' "${PREVIOUS_TAG}..${GITHUB_SHA}" || true
+                fi
+              fi
+            else
+              echo "首次发布或未找到上一版本 tag。"
+              echo
+              git log --no-merges --pretty=format:'- %s (`%h`)' -n 20 || true
+            fi
+            echo
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+
       - name: Upload firmware artifact (7-day retention)
         uses: actions/upload-artifact@v4
         with:
@@ -93,6 +170,10 @@ jobs:
           files: dist/*.bin
           body: |
             SMS Forwarder ESP-IDF 固件 **v${{ steps.version.outputs.version }}**（构建自 `${{ github.sha }}`）
+
+            ## 更新内容
+
+            ${{ steps.changelog.outputs.notes }}
 
             | 文件 | 用途 |
             | --- | --- |

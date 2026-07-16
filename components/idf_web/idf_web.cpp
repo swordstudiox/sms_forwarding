@@ -525,6 +525,8 @@ static esp_err_t send_config_json(httpd_req_t* req)
     body += "{";
     json_prop(body, "wifiSsid", cfg.wifiSsid); body += ",";
     json_prop(body, "wifiSsid2", cfg.wifiSsid2); body += ",";
+    snprintf(buf, sizeof(buf), "\"wifiCount\":%u,", static_cast<unsigned>(cfg.wifiNetworkCount));
+    body += buf;
     body += "\"wifiNetworks\":[";
     for (int i = 0; i < cfg.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS; ++i) {
         if (i) body += ",";
@@ -1563,7 +1565,9 @@ static esp_err_t handle_import_config(httpd_req_t* req)
 
 static void restart_task(void*)
 {
-    vTaskDelay(pdMS_TO_TICKS(1200));
+    // WiFi/恢复出厂保存会先回 HTTP 响应再重启；多 WiFi 全量保存后给 TCP flush 留足时间，
+    // 避免配置已写入但浏览器端只看到请求超时。
+    vTaskDelay(pdMS_TO_TICKS(3000));
     // 计划内重启先给模组断电：保留"重启设备可救活已卡死模组"的原有语义，
     // 模组热启动快路径只留给崩溃/看门狗等意外复位
     idf_modem_power_off_for_restart();
@@ -1643,7 +1647,7 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     }
 
     if (idf_wifi_is_ap_mode() && !ssid_s.empty()) {
-        IdfConfig current = idf_config_get();
+        std::vector<IdfWifiNetwork> current = idf_config_get_wifi_networks();
         IdfWifiNetwork provision_networks[IDF_MAX_WIFI_NETWORKS];
         bool provision_preserve[IDF_MAX_WIFI_NETWORKS] = {};
         bool provision_clear[IDF_MAX_WIFI_NETWORKS] = {};
@@ -1651,9 +1655,10 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
         provision_networks[0].pass = pass_s;
         provision_preserve[0] = false;
         int out_count = 1;
-        for (int i = 0; i < current.wifiNetworkCount && i < IDF_MAX_WIFI_NETWORKS && out_count < IDF_MAX_WIFI_NETWORKS; ++i) {
-            if (current.wifiNetworks[i].ssid.empty() || current.wifiNetworks[i].ssid == ssid_s) continue;
-            provision_networks[out_count] = current.wifiNetworks[i];
+        for (const IdfWifiNetwork& net : current) {
+            if (out_count >= IDF_MAX_WIFI_NETWORKS) break;
+            if (net.ssid.empty() || net.ssid == ssid_s) continue;
+            provision_networks[out_count] = net;
             provision_preserve[out_count] = true;
             ++out_count;
         }
@@ -1682,7 +1687,12 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
-    std::string msg = "{\"success\":true,\"message\":\"WiFi 已保存，设备即将重启\"}";
+    idf_logf("WiFi 配置已保存: %d 个，设备即将重启", network_count);
+    char message[96];
+    snprintf(message, sizeof(message), "WiFi 已保存 %d 个，设备即将重启", network_count);
+    std::string msg = "{\"success\":true,";
+    json_prop(msg, "message", message);
+    msg += "}";
     esp_err_t send_err = httpd_resp_send(req, msg.c_str(), msg.size());
     schedule_restart_or_now("wifi_restart");
     return send_err;

@@ -10,7 +10,7 @@
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
 static constexpr int IDF_MAX_WIFI_NETWORKS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.0.9-fork.1";
+static constexpr const char* IDF_FW_VERSION = "1.0.9-fork.2";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
 static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "http://gg.incrafttime.top/api/payload?size=64342";
@@ -286,6 +286,9 @@ struct IdfSchedulerView {
     IdfSchedTask schedTasks[IDF_MAX_SCHED_TASKS];
 };
 
+// 完整配置深拷贝：会复制多个 std::string、推送通道和定时任务数组。
+// 仅用于启动期或已确认栈空间充足的上下文；HTTP handler、事件回调、timer、
+// 3KB/4KB 小任务应优先使用下面的窄访问器，或在实现内部用堆上快照。
 IdfConfig idf_config_get(void);
 IdfConfigStatusView idf_config_get_status_view(void);
 IdfConfigWebView idf_config_get_web_view(void);
