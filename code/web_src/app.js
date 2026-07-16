@@ -112,9 +112,10 @@
         var folded = !en;
         html += '<div class="push-channel' + (en ? ' enabled' : '') + (folded ? ' folded' : '') + (configured ? ' configured' : '') + '" id="channel' + idx + '" data-configured="' + (configured ? '1' : '0') + '">';
         html += '<div class="push-channel-header">';
-        html += '<input type="checkbox" class="switch-input" name="push' + idx + 'en" id="push' + idx + 'en" onchange="toggleChannel(' + idx + ')"' + (en ? ' checked' : '') + '><span class="switch-slider"></span>';
+        html += '<label class="switch-inline"><input type="checkbox" class="switch-input" name="push' + idx + 'en" id="push' + idx + 'en" onchange="toggleChannel(' + idx + ')"' + (en ? ' checked' : '') + '><span class="switch-slider"></span></label>';
         html += '<label for="push' + idx + 'en" class="label-inline">启用推送通道 ' + (i + 1) + '</label>';
         html += '<span class="ch-summary" id="chsum' + idx + '"></span>';
+        html += '<button type="button" class="btn btn-danger btn-sm" onclick="deleteChannel(' + idx + ')">删除</button>';
         html += '<button type="button" class="channel-fold" onclick="toggleChannelBody(' + idx + ')" id="foldBtn' + idx + '">展开</button>';
         html += '</div><div class="push-channel-body">';
         html += '<div class="form-group"><label>通道名称</label><input type="text" name="push' + idx + 'name" value="' + htmlEsc(ch.name || defName) + '" placeholder="自定义名称" oninput="updateChannelSummary(' + idx + ')"></div>';
@@ -292,6 +293,61 @@
       ch.classList.toggle('folded');
       updateChannelFoldText(idx);
     }
+    function deleteChannel(idx) {
+      var ch = document.getElementById('channel' + idx);
+      var form = document.getElementById('mainForm3');
+      if (!ch || !form) return;
+      var nameEl = form.querySelector('[name="push' + idx + 'name"]');
+      var displayName = nameEl && nameEl.value.trim() ? nameEl.value.trim() : ('通道' + (idx + 1));
+      if (!confirm('确定删除“' + displayName + '”？\n\n保存后会清空 URL、密钥和高级参数；引用该通道的转发规则不会自动删除。')) return;
+
+      var enabled = document.getElementById('push' + idx + 'en');
+      if (enabled) enabled.checked = false;
+      if (nameEl) nameEl.value = '通道' + (idx + 1);
+      var type = document.getElementById('push' + idx + 'type');
+      if (type) type.value = '1';
+      ['url', 'key1', 'key2'].forEach(function(prefix) {
+        var el = document.getElementById(prefix + idx);
+        if (el) el.value = '';
+      });
+      var body = form.querySelector('[name="push' + idx + 'body"]');
+      if (body) body.value = '';
+      for (var slot = 1; slot <= 2; slot++) {
+        var keep = document.getElementById('key' + slot + 'Keep' + idx);
+        if (keep) { keep.value = '0'; keep.dataset.saved = '0'; }
+        var clear = form.querySelector('[name="push' + idx + 'key' + slot + 'Clear"]');
+        if (clear) clear.checked = false;
+        var clearWrap = document.getElementById('key' + slot + 'ClearWrap' + idx);
+        var savedHint = document.getElementById('key' + slot + 'SavedHint' + idx);
+        if (clearWrap) clearWrap.style.display = 'none';
+        if (savedHint) savedHint.style.display = 'none';
+      }
+      var barkBox = document.getElementById('barkParams' + idx);
+      if (barkBox) barkBox.querySelectorAll('input,select').forEach(function(el) { el.value = ''; });
+      var barkOther = document.getElementById('bark_other' + idx);
+      if (barkOther) barkOther.value = '';
+      var barkAdvanced = document.getElementById('barkAdvanced' + idx);
+      if (barkAdvanced) barkAdvanced.open = false;
+      var result = document.getElementById('pushTestResult' + idx);
+      if (result) { result.className = 'result-box'; result.textContent = ''; }
+
+      var marker = form.querySelector('[name="push' + idx + 'delete"]');
+      if (!marker) {
+        marker = document.createElement('input');
+        marker.type = 'hidden';
+        marker.name = 'push' + idx + 'delete';
+        form.appendChild(marker);
+      }
+      marker.value = '1';
+      ch.dataset.configured = '0';
+      ch.classList.remove('enabled');
+      ch.classList.add('folded');
+      ch.style.display = 'none';
+      updateChannelSummary(idx);
+      updateChannelFoldText(idx);
+      updateAddBtn();
+      showToast('已标记删除，点击“保存推送通道”后生效', 'ok');
+    }
     var barkKeys = ['subtitle','group','level','sound','badge','ttl','icon','image','url','copy','autoCopy','isArchive','call','action','id'];
     function barkDecode(v) {
       try { return decodeURIComponent(String(v || '').replace(/\+/g, ' ')); } catch (e) { return String(v || ''); }
@@ -443,6 +499,9 @@
       for (var i = 0; i < 5; i++) {
         var ch = document.getElementById('channel' + i);
         if (ch && ch.style.display === 'none') {
+          var form = document.getElementById('mainForm3');
+          var marker = form ? form.querySelector('[name="push' + i + 'delete"]') : null;
+          if (marker) marker.remove();
           ch.style.display = '';
           ch.dataset.configured = '1';
           ch.classList.remove('folded');
@@ -980,7 +1039,7 @@
       card.style.display = 'none';
       card.innerHTML =
         '<div class="push-channel-header">' +
-          '<input type="checkbox" class="switch-input" name="st' + i + 'En" id="st' + i + 'En" onchange="stSyncHead(' + i + ')"><span class="switch-slider"></span>' +
+          '<label class="switch-inline"><input type="checkbox" class="switch-input" name="st' + i + 'En" id="st' + i + 'En" onchange="stSyncHead(' + i + ')"><span class="switch-slider"></span></label>' +
           '<label for="st' + i + 'En" class="label-inline">启用任务 ' + (i + 1) + '</label>' +
           '<span class="ch-summary" id="st' + i + 'Sum"></span>' +
           '<span class="schedule-tag" id="st' + i + 'Countdown" style="margin-left:auto;">--</span>' +

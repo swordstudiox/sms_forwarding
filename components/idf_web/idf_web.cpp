@@ -1219,7 +1219,7 @@ static void modem_apply_task(void* raw)
 
     if (data_changed) {
         if (data_enabled && !roaming_enabled && modem.ceregStat == 5) {
-            // 数据漫游关闭且当前漫游：不激活蜂窝数据(短信仍走 CS/IMS 不受影响)
+            // 数据漫游关闭且当前漫游：仅不激活数据 PDP；短信可用性由 SIM、模组与运营商网络共同决定
             idf_modem_send_at("AT+CGACT=0,1", 5000, resp);
             idf_log_line("数据漫游已关闭：当前处于漫游，未激活蜂窝数据(不跑流量)");
         } else if (data_enabled) {
@@ -1269,6 +1269,12 @@ static void parse_push_channels_form(const IdfFormFields& fields,
 {
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         char key[24];
+        snprintf(key, sizeof(key), "push%ddelete", i);
+        if (has_field(fields, key)) {
+            // 删除优先于同一表单里的其它字段，确保脱敏密钥保留逻辑不会带回旧值。
+            channels[i] = IdfPushChannel{};
+            continue;
+        }
         snprintf(key, sizeof(key), "push%den", i);
         channels[i].enabled = has_field(fields, key);
         snprintf(key, sizeof(key), "push%dtype", i);

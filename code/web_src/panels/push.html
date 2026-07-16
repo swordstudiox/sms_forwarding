@@ -30,6 +30,7 @@
           <label class="switch-row" style="margin-bottom:12px;"><span class="switch-text">启用推送转发</span><input type="checkbox" class="switch-input" name="pushEnabled" %PUSH_EN%><span class="switch-slider"></span></label>
           %PUSH_CHANNELS%
           <button type="button" class="btn btn-secondary btn-block" id="addChannelBtn" onclick="addChannel()" style="margin-top:8px;">+ 添加推送通道</button>
+          <p class="form-hint" style="margin-top:8px;">删除通道会清空该槽位保存的 URL、密钥和高级参数，点击下方“保存推送通道”后生效；转发规则中对该槽位的引用不会自动删除。</p>
         </div>
       </div>
       <button type="submit" class="btn btn-primary btn-block btn-save">保存推送通道</button>

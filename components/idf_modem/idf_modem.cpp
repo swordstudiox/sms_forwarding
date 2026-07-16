@@ -146,16 +146,33 @@ struct TickDeadline {
     void restart(uint32_t ms) { start = xTaskGetTickCount(); span = pdMS_TO_TICKS(ms); }
 };
 
-// AT 最终结果码：1=OK，-1=ERROR/+CMS ERROR/+CME ERROR(27.005/27.007 定义的失败终结码)，0=未结束
+// AT 最终结果码：1=OK，-1=ERROR/+CMS ERROR/+CME ERROR(27.005/27.007 定义的失败终结码)，0=未结束。
+// 不要求末尾必须再跟 CRLF：部分长命令的最后一个 UART 块可能恰好止于 "OK"。
 static int at_final_result(const std::string& resp)
 {
-    if (resp.find("\r\nOK\r\n") != std::string::npos ||
-        resp.find("\nOK\r\n") != std::string::npos) return 1;
-    if (resp.find("\r\nERROR\r\n") != std::string::npos ||
-        resp.find("\nERROR\r\n") != std::string::npos ||
-        resp.find("+CMS ERROR") != std::string::npos ||
-        resp.find("+CME ERROR") != std::string::npos) return -1;
+    size_t pos = 0;
+    while (pos < resp.size()) {
+        size_t end = resp.find_first_of("\r\n", pos);
+        if (end == std::string::npos) end = resp.size();
+        std::string line = trim(resp.substr(pos, end - pos));
+        if (line == "OK") return 1;
+        if (line == "ERROR" || line.rfind("+CMS ERROR", 0) == 0 ||
+            line.rfind("+CME ERROR", 0) == 0) return -1;
+        pos = end;
+        while (pos < resp.size() && (resp[pos] == '\r' || resp[pos] == '\n')) ++pos;
+    }
     return 0;
+}
+
+static bool has_cmgs_result(const std::string& resp)
+{
+    size_t pos = resp.find("+CMGS:");
+    if (pos == std::string::npos) return false;
+    pos += strlen("+CMGS:");
+    while (pos < resp.size() && isspace(static_cast<unsigned char>(resp[pos]))) ++pos;
+    if (pos >= resp.size() || !isdigit(static_cast<unsigned char>(resp[pos]))) return false;
+    while (pos < resp.size() && isdigit(static_cast<unsigned char>(resp[pos]))) ++pos;
+    return true;
 }
 
 // 取包含 token 的那一整行(不同 URC 混在同一段响应里时不能只取"第一有效行")
@@ -623,6 +640,12 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
             if (got > 0) {
                 append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
                 scan.append(reinterpret_cast<const char*>(buf), got);
+                // 官方手册定义 +CMGS:<mr> 即网络已接受 SMS-SUBMIT；某些固件的尾随 OK
+                // 可能没有完整 CRLF，不能因此把已经发送成功的短信等到超时。
+                if (has_cmgs_result(response) || has_cmgs_result(scan)) {
+                    ret = ESP_OK;
+                    break;
+                }
                 int final_code = at_final_result(scan);
                 if (final_code != 0) {
                     ret = final_code > 0 ? ESP_OK : ESP_FAIL;
@@ -1247,7 +1270,8 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
 
 // 数据漫游策略兜底：未勾选"允许数据漫游"且当前漫游(stat=5)时确保蜂窝数据关闭。
 // 启动阶段拿不到注册状态会先乐观激活，注册完成后在此关闭，避免漫游误跑流量。
-// 短信不受影响(走 CS/IMS 信令域)。归属网络(stat=1)不干预，按常规激活。
+// 此开关只控制数据 PDP；短信是否可用由 SIM、模组和运营商短信承载共同决定，
+// 不能仅凭 CEREG/CREG 中的某一个状态判断。归属网络(stat=1)不干预，按常规激活。
 static void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
 {
     if (!cfg.dataEnabled || cfg.roamingEnabled) return;  // 未开数据或允许漫游数据：无需干预
@@ -1769,14 +1793,16 @@ void idf_modem_reassert_sms_storage(void)
     select_sms_storage();
 }
 
-static void configure_sms_and_registration(void)
+static bool configure_sms_and_registration(void)
 {
     send_ok("ATE0", 1000);
-    send_ok("AT+CMGF=0", 1200);
+    send_ok("AT+CMEE=1", 1200);  // 明确返回 +CMS/+CME 数字错误，避免只有笼统 ERROR
+    bool pdu_mode_ok = send_ok("AT+CMGF=0", 1200);
     // 统一收/存/读的短信存储位置：CNMI mt=1 投递到 <mem3>，CMGL/CMGR 读 <mem1>，
     // 两者不一致时 +CMTI 索引和补收轮询会看不同的存储，短信被静默丢失
-    s_sms_storage_pending = !select_sms_storage();
-    send_ok("AT+CNMI=2,1,0,0,0", 1200);
+    bool storage_ok = select_sms_storage();
+    s_sms_storage_pending = !storage_ok;
+    bool cnmi_ok = send_ok("AT+CNMI=2,1,0,0,0", 1200);
     send_ok("AT+CEREG=2", 1200);
     // 开启主叫号码上报：来电时模组主动上报 RING + +CLIP: "号码",...，供来电通知使用。
     // 无语音能力的卡/模组下该指令可能 ERROR，忽略即可(收不到来电就不会有 URC)。
@@ -1784,6 +1810,9 @@ static void configure_sms_and_registration(void)
     // NET 指示灯开关(ML307R: AT+MLED=0,<0/1>)：每次初始化按保存的配置下发，
     // 覆盖模组记住的上次状态
     send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
+    bool sms_ready = pdu_mode_ok && storage_ok && cnmi_ok;
+    if (!sms_ready) idf_log_line("短信收发配置未完整生效，将在后续健康检查中重试");
+    return sms_ready;
 }
 
 // 查询 SIM 是否就绪：AT+CPIN? 返回 +CPIN: READY 视为有卡可用；无卡/卡故障时模组回
@@ -1801,10 +1830,10 @@ static bool query_sim_ready(void)
 // 数据连接按模组默认自动激活(产生流量费，恰是本项目要防止的)。
 static bool s_reinit_pending = false;
 
-static void handle_reset_request_if_any(void)
+static bool handle_reset_request_if_any(void)
 {
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
-    if (request == 0) return;
+    if (request == 0) return false;
 
     IdfModemStatus patch;
     patch.phase = "powering";
@@ -1825,7 +1854,7 @@ static void handle_reset_request_if_any(void)
         set_phase("failed");
         idf_log_line("模组重启后 AT 握手失败，等待恢复后补跑初始化");
         s_reinit_pending = true;
-        return;
+        return true;
     }
     patch = {};
     patch.started = true;
@@ -1837,6 +1866,7 @@ static void handle_reset_request_if_any(void)
     set_phase("registering");
     apply_startup_data_mode();
     s_reinit_pending = false;
+    return true;
 }
 
 // AT 恢复后的补初始化（配合 s_reinit_pending）
@@ -1960,11 +1990,26 @@ static void modem_task(void*)
     int health_fail_count = 0;
     int dereg_count = 0;
     TickType_t last_sim_check = 0;
+    int64_t sim_check_not_before_us = 0;  // 模组重启后给 SIM/CPIN 充分上电时间，避免误判二次拔插
     int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
+    bool sms_reconfigure_pending = false;  // 换卡/掉网恢复后在注册成功点再次重申短信栈
     while (true) {
-        handle_reset_request_if_any();
+        bool reset_handled = handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
         TickType_t now = xTaskGetTickCount();
+        if (reset_handled) {
+            // 运行中重启不能沿用重启前的局部注册状态；否则 status 已进入 registering，
+            // 但本任务仍以 registered=true 按 60 秒慢周期探测，换卡后恢复会被无谓拖延。
+            registered = false;
+            post_register_done = false;
+            health_fail_count = 0;
+            dereg_count = 0;
+            last_health = 0;
+            last_sim_check = now;  // 给 SIM 上电初始化留出一个完整检测周期
+            sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
+            sim_present = -1;
+            sms_reconfigure_pending = true;
+        }
         if (process_data_mode_retry()) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
@@ -2000,9 +2045,13 @@ static void modem_task(void*)
                 post_register_done = true;
             }
         }
-        // 健康探测按 60s 门控(对齐 Arduino MODEM_HEALTH_INTERVAL_MS)，
-        // 不再每 ~5s 抢占 AT 通道与 URC 竞争
-        if (now - last_health > pdMS_TO_TICKS(60000) && at_channel_idle_now()) {
+        // 正常态按 60s 健康探测；未注册但并非已确认无卡时缩短到 5s，
+        // 让热插拔/自动重启后的注册恢复不必最多再等一分钟。
+        uint32_t health_interval_ms = 60000UL;
+        if (!registered && sim_present != 0) health_interval_ms = 5000UL;
+        else if (sms_reconfigure_pending && sim_present != 0) health_interval_ms = 15000UL;
+        if ((reset_handled || now - last_health > pdMS_TO_TICKS(health_interval_ms)) &&
+            at_channel_idle_now()) {
             last_health = now;
             std::string resp;
             if (send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat)) {
@@ -2016,11 +2065,19 @@ static void modem_task(void*)
                 if (now_ready) {
                     registered = true;
                     dereg_count = 0;
+                    bool sms_reconfigured_now = false;
+                    if (sms_reconfigure_pending) {
+                        // CPIN READY 之后模组仍可能异步重建短信栈并回落默认设置；
+                        // 必须在真正注册成功的稳定点再次写入 PDU/CNMI/CPMS。
+                        idf_log_line("网络重新注册成功，重申短信收发配置");
+                        sms_reconfigure_pending = !configure_sms_and_registration();
+                        sms_reconfigured_now = true;
+                    }
                     if (!post_register_done) {
                         // 迟到/恢复的注册也要补跑必须的网络配置和首页基础信息。
                         // 掉网后恢复可能意味着模组自发复位过：存储选择无条件重跑，
                         // 不能只看 pending 标志(初次成功后它恒为 false)
-                        s_sms_storage_pending = !select_sms_storage();
+                        if (!sms_reconfigured_now) s_sms_storage_pending = !select_sms_storage();
                         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
                         apply_operator_if_configured(cfg);
                         if (cfg.dataEnabled) sample_cell_ip_once();
@@ -2034,9 +2091,12 @@ static void modem_task(void*)
                 } else {
                     registered = false;
                     post_register_done = false;
-                    // AT 正常但长时间未注册(射频卡死/SIM 掉网)：这是 Arduino 版"3 天后只发不收"
-                    // 的经典故障形态，累计 5 次(约 5 分钟)后硬重启自愈
-                    if (++dereg_count >= 5) {
+                    sms_reconfigure_pending = true;
+                    // 未注册态改为 5 秒快探测后，仍保持约 5 分钟再重启，避免普通的小区
+                    // 重选/漫游注册过程被过早打断；已确认无卡时不做无意义的周期重启。
+                    if (sim_present == 0) {
+                        dereg_count = 0;
+                    } else if (++dereg_count >= 60) {
                         dereg_count = 0;
                         idf_log_line("模组长时间未注册网络，触发硬重启恢复");
                         s_reset_request.store(2, std::memory_order_relaxed);
@@ -2049,9 +2109,10 @@ static void modem_task(void*)
             }
         }
         // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。
-        // 插入(无卡→有卡)：重跑短信/网络配置 + 作废旧身份触发重采样，让新卡自动初始化；
+        // 插入(无卡→有卡)：自动硬重启模组 + 作废旧身份，让新卡从干净状态初始化；
         // 拔出(有卡→无卡)：标记未就绪并清空身份，避免概览沿用旧卡信息。
-        if ((last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
+        if (esp_timer_get_time() >= sim_check_not_before_us &&
+            (last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
             at_channel_idle_now()) {
             last_sim_check = now;
             int present_now = query_sim_ready() ? 1 : 0;
@@ -2060,18 +2121,21 @@ static void modem_task(void*)
             } else if (present_now != sim_present) {
                 sim_present = present_now;
                 if (present_now == 1) {
-                    idf_log_line("检测到 SIM 卡插入，重新初始化模组");
-                    configure_sms_and_registration();
+                    // 仅在 CPIN READY 时立即重发 CMGF/CNMI 不够可靠：部分 ML307 固件会在
+                    // 换卡后继续异步重建协议栈，随后把短信模式恢复默认值。自动硬重启一次，
+                    // 等价于用户手动断电恢复，同时保留“换卡无需重启 ESP32”的体验。
+                    idf_log_line("检测到 SIM 卡插入，自动硬重启模组以完整初始化短信栈");
                     idf_modem_invalidate_sim_identity();
                     registered = false;
                     post_register_done = false;
                     dereg_count = 0;
-                    last_health = 0;  // 下一轮立即重查 CEREG，尽快感知新卡注册
-                    set_phase("registering");
+                    sms_reconfigure_pending = true;
+                    idf_modem_request_reset(true);
                 } else {
                     idf_log_line("检测到 SIM 卡移除");
                     registered = false;
                     post_register_done = false;
+                    sms_reconfigure_pending = true;
                     idf_modem_invalidate_sim_identity();
                     set_phase("registering");
                 }

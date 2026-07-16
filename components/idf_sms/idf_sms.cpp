@@ -43,6 +43,9 @@ static constexpr uint32_t SMS_POLL_INTERVAL_MS = 60000;
 static constexpr uint32_t SMS_STARTUP_POLL_INTERVAL_MS = 8000;
 static constexpr uint32_t SMS_STARTUP_FAST_WINDOW_MS = 120000;
 static constexpr uint8_t SMS_CNMI_REASSERT_EVERY = 5;
+// 漫游/小区重选时 ML307 的 +CMGS 最终响应可能明显超过 20 秒；网页发送本身已异步，
+// 这里允许等到 60 秒，避免 PDU 已交给模组却被固件过早判成失败。
+static constexpr uint32_t SMS_SUBMIT_TIMEOUT_MS = 60000;
 
 struct ConcatPart {
     bool valid = false;
@@ -1142,6 +1145,9 @@ static bool sms_text_basic_gsm7(const std::string& text)
     for (unsigned char c : text) {
         if (c == '\r' || c == '\n') continue;
         if (c < 0x20 || c >= 0x7F) return false;
+        // 反引号不属于 GSM 03.38；PDU 编码器会为整段改用 UCS2。
+        // 若这里误判为 GSM7，71~160 字符的混合文本会直到编码阶段才超长失败。
+        if (c == '`') return false;
     }
     return true;
 }
@@ -1195,6 +1201,36 @@ static esp_err_t sms_encode_one(const std::string& phone, const std::string& bod
     return ESP_OK;
 }
 
+static std::string sms_response_error_line(const std::string& response)
+{
+    static const char* kTokens[] = {"+CMS ERROR", "+CME ERROR", "ERROR"};
+    size_t pos = 0;
+    while (pos < response.size()) {
+        size_t end = response.find('\n', pos);
+        if (end == std::string::npos) end = response.size();
+        std::string line = trim(response.substr(pos, end - pos));
+        for (const char* token : kTokens) {
+            if (line.find(token) != std::string::npos) return line;
+        }
+        pos = end + 1;
+    }
+    return {};
+}
+
+static std::string sms_submit_failure_detail(esp_err_t err, const std::string& response)
+{
+    std::string error_line = sms_response_error_line(response);
+    if (!error_line.empty()) return error_line;
+    if (err == ESP_ERR_TIMEOUT) {
+        if (response.find('>') != std::string::npos) {
+            return "短信提交超时（已提交 PDU，但模组未返回 +CMGS/OK，发送结果未知）";
+        }
+        return "等待短信输入提示符超时（PDU 尚未提交）";
+    }
+    if (err == ESP_OK) return "模组响应格式异常";
+    return esp_err_to_name(err);
+}
+
 esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& text_raw, std::string& message)
 {
     message.clear();
@@ -1229,6 +1265,19 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
     }
 
     esp_err_t err = ESP_OK;
+    // 热插拔/模组内部协议栈复位可能把 CMGF 恢复成文本模式。文本模式同样会返回
+    // `>`，但随后把十六进制 PDU 当普通正文处理，最终表现为无 +CMGS 的超时。
+    // 每次发送前重申一次 PDU 模式，代价很小，却能直接封住这一类静默状态漂移。
+    std::string mode_resp;
+    err = idf_modem_send_at("AT+CMGF=0", 3000, mode_resp);
+    if (err != ESP_OK) {
+        message = "无法恢复短信 PDU 模式: " + sms_submit_failure_detail(err, mode_resp);
+        idf_sent_add(phone.c_str(), text.c_str(), false);
+        idf_logf("发送前短信模式配置失败，触发模组硬重启: %s", message.c_str());
+        idf_modem_request_reset(true);
+        return err;
+    }
+
     for (size_t i = 0; i < parts.size(); ++i) {
         std::string sms_pdu;
         int pdu_len = -1;
@@ -1244,16 +1293,22 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "AT+CMGS=%d", pdu_len);
         std::string resp;
-        err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), 20000, resp);
+        err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), SMS_SUBMIT_TIMEOUT_MS, resp);
         if (err != ESP_OK) {
+            std::string detail = sms_submit_failure_detail(err, resp);
             if (parts.size() > 1) {
-                char buf[96];
-                snprintf(buf, sizeof(buf), "长短信第 %u/%u 段发送失败: %s",
-                         static_cast<unsigned>(i + 1), static_cast<unsigned>(parts.size()),
-                         resp.empty() ? esp_err_to_name(err) : trim(resp).c_str());
-                message = buf;
+                char prefix[64];
+                snprintf(prefix, sizeof(prefix), "长短信第 %u/%u 段发送失败: ",
+                         static_cast<unsigned>(i + 1), static_cast<unsigned>(parts.size()));
+                message = std::string(prefix) + detail;
             } else {
-                message = resp.empty() ? std::string(esp_err_to_name(err)) : trim(resp);
+                message = detail;
+            }
+            if (err == ESP_ERR_TIMEOUT) {
+                // Ctrl+Z 后超时属于结果不确定态，不能自动重发（否则可能重复扣费/重复送达）；
+                // 但必须把模组拉回干净状态，保证下一条短信不被残留 CMGS 会话污染。
+                idf_log_line("短信提交超时，自动硬重启模组恢复短信通道；本条不自动重发");
+                idf_modem_request_reset(true);
             }
             idf_sent_add(phone.c_str(), text.c_str(), false);
             idf_logf("网页发送短信失败: %s", message.c_str());
