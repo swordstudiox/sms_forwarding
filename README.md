@@ -241,11 +241,64 @@ start preview\index.html
 | --- | --- |
 | ![诊断与控制](assets/ui-diagnose.png) | ![系统日志](assets/ui-log.png) |
 
-## 烧录教程
+## 固件下载与刷写
 
-### 1. 准备环境
+普通用户不需要下载源码，也不需要安装 Python 或 ESP-IDF。到 GitHub Release 下载对应版本的 `.bin` 文件即可：
 
-推荐环境：
+| 文件 | 用途 | 使用场景 |
+| --- | --- | --- |
+| `sms_forwarder_full_v*.bin` | 整机刷写包，烧录地址 `0x0` | 首次刷机、救砖、分区表变化后重刷 |
+| `sms_forwarder_ota_v*.bin` | OTA 升级包，只包含 app 分区镜像 | 设备已经能打开 Web UI 时，在网页“固件升级”上传 |
+
+注意：`full` 包和 `ota` 包不能混用。首次刷机请把 `sms_forwarder_full_v*.bin` 写到 `0x0`；网页 OTA 只上传 `sms_forwarder_ota_v*.bin`。
+
+### 首次刷机（推荐 GUI）
+
+推荐用乐鑫官方图形工具，普通用户不用接触命令行：
+
+- Windows：使用 [Flash Download Tool](https://docs.espressif.com/projects/esp-test-tools/en/latest/esp32c3/production_stage/tools/flash_download_tool.html)。选择 `ESP32-C3`，模式选 `Develop`，下载方式选 `UART`，把 `sms_forwarder_full_v*.bin` 填到地址 `0x0`，选择实际 `COM` 口和波特率 `460800` 后点击 `START`。
+- Chrome / Edge：使用 [ESP Launchpad](https://espressif.github.io/esp-launchpad/) 的自定义固件刷写功能。连接设备后选择本地 `sms_forwarder_full_v*.bin`，地址填 `0x0`，再开始刷写。
+
+如果自动进入下载模式失败，可以按住开发板 `BOOT`，轻点 `RST/EN`，开始烧录后松开 `BOOT`。不同 ESP32-C3 开发板按钮名称可能不同，以板子丝印为准。
+
+### 首次刷机（开发者命令行）
+
+已经安装 Python/esptool 的用户，也可以直接用命令行刷完整包：
+
+```powershell
+esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v1.0.9-fork.4.bin
+```
+
+其中 `COM5` 和文件名按实际情况替换。`esptool.py` 是电脑端刷写工具，不在固件里；没有 Python 环境时请优先使用上面的 GUI 工具。
+
+### 后续 OTA 升级
+
+设备已经能进入 Web UI 时，不需要数据线：
+
+1. 打开设备网页。
+2. 进入“系统设置 / 固件升级 (OTA)”。
+3. 选择 `sms_forwarder_ota_v*.bin`。
+4. 可选填入 Release 页面提供的 OTA 包 SHA-256。
+5. 点击升级，等待设备自动重启。
+
+不要把 `sms_forwarder_full_v*.bin` 上传到网页 OTA。完整包包含 bootloader 和分区表，只适合从 `0x0` 串口整机刷写。
+
+### 首次访问 Web UI
+
+首次启动时设备会读取已知 WiFi 网络列表（最多 5 个），先扫描当前环境，匹配已保存 SSID，并优先连接当前 RSSI 最好的已知网络。
+
+- 没有任何 WiFi 配置时，设备会立即开启开放配网热点 `SMS-Forwarder-XXXX`。
+- 已有 WiFi 配置但开机 60 秒仍未获得 IP 时，设备会开启 10 分钟临时配网热点；这适合换路由器、密码变更、设备搬到新环境且没有外露 BOOT 按键的救援场景。
+- 正常运行中如果 WiFi 掉线，设备不会自动打开无密码配网热点，而是周期扫描已知网络并自动连回；需要重新配网时可断电重启，等待 60 秒救援热点出现。
+- 如果硬件有可用 BOOT 键，长按约 5 秒仍可手动开启配网热点。
+
+连接热点后访问 `http://192.168.1.1` 配网；设备连上路由器后，可通过串口日志里的 IP 地址或默认 `http://sms.local` 打开 Web UI。主机名可在“系统设置 → 局域网域名”中修改，多台设备请设置不同主机名。
+
+默认账号密码为 `admin` / `admin123`，首次使用请立即修改。
+
+## 本地开发构建
+
+开发者需要本地编译固件时，再准备源码和 ESP-IDF：
 
 - Windows + PowerShell。
 - ESP32-C3 开发板或 ESP32-C3 Super Mini。
@@ -259,22 +312,12 @@ start preview\index.html
 Get-CimInstance Win32_SerialPort | Select-Object DeviceID,Description
 ```
 
-如果设备显示为 `COM5`，后续命令就使用 `-Port COM5`；如果是其他端口，把命令里的端口替换掉。
-
-### 2. 拉取并进入项目
+拉取并进入项目：
 
 ```powershell
 git clone https://github.com/MineSunshineone/sms_forwarding.git
 cd sms_forwarding
 ```
-
-已有仓库时直接进入项目目录即可：
-
-```powershell
-cd E:\GitHub-Repo\sms_forwarding
-```
-
-### 3. 构建固件
 
 仓库提供了 ESP-IDF 封装脚本，会自动加载 ESP-IDF 环境，并把构建产物放在 `build/idf`，把 `sdkconfig` 放在 `build/sdkconfig`：
 
@@ -289,34 +332,19 @@ python tools\build_web_assets.py
 python tools\build_web_assets.py --check
 ```
 
-### 4. 烧录到 ESP32-C3
+本地编译后烧录到 ESP32-C3：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
 ```
 
-如果自动进入下载模式失败，可以按住开发板 `BOOT`，轻点 `RST/EN`，开始烧录后松开 `BOOT`。不同 ESP32-C3 开发板按钮名称可能不同，以板子丝印为准。
-
-### 5. 打开串口日志
+打开串口日志：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
 ```
 
 `monitor` 中可以看到 WiFi 连接、模组初始化、短信接收、推送、Web 访问和崩溃原因等日志。退出 monitor 通常使用 `Ctrl+]`。
-
-### 6. 首次访问 Web UI
-
-首次启动时设备会读取已知 WiFi 网络列表（最多 5 个），先扫描当前环境，匹配已保存 SSID，并优先连接当前 RSSI 最好的已知网络。
-
-- 没有任何 WiFi 配置时，设备会立即开启开放配网热点 `SMS-Forwarder-XXXX`。
-- 已有 WiFi 配置但开机 60 秒仍未获得 IP 时，设备会开启 10 分钟临时配网热点；这适合换路由器、密码变更、设备搬到新环境且没有外露 BOOT 按键的救援场景。
-- 正常运行中如果 WiFi 掉线，设备不会自动打开无密码配网热点，而是周期扫描已知网络并自动连回；需要重新配网时可断电重启，等待 60 秒救援热点出现。
-- 如果硬件有可用 BOOT 键，长按约 5 秒仍可手动开启配网热点。
-
-连接热点后访问 `http://192.168.1.1` 配网；设备连上路由器后，可通过串口日志里的 IP 地址或默认 `http://sms.local` 打开 Web UI。主机名可在“系统设置 → 局域网域名”中修改，多台设备请设置不同主机名。
-
-默认账号密码为 `admin` / `admin123`，首次使用请立即修改。
 
 CI 使用 `.github/workflows/build.yml` 构建 ESP-IDF 固件，日常本地开发建议仍使用 `tools\idf.ps1`，这样构建目录和配置文件位置保持一致。
 
